@@ -124,6 +124,62 @@ function unwrap(result) {
   return result
 }
 
+/**
+ * One checkbox flip in the panel, kept aligned with the deletion closure:
+ * the Host deletes a session's descendants together with it, so the checked
+ * set (and the "N sessions (X)" totals built from it) must match that
+ * closure exactly.
+ *
+ * - Selecting a session selects its whole descendant subtree.
+ * - Deselecting one drops its subtree AND every selected ancestor: a checked
+ *   ancestor would drag the subtree back into the delete set on the Host
+ *   side, and the panel totals would understate what actually gets removed.
+ *
+ * Children link upward through `parent`; the subtree is walked breadth-first
+ * so grandchildren join even when their parent is missing from the list.
+ */
+function toggleWithDescendants(sessions, selected, id) {
+  const childrenOf = new Map()
+  const parentOf = new Map()
+  for (const session of sessions) {
+    if (session.parent !== undefined) {
+      parentOf.set(session.id, session.parent)
+      const list = childrenOf.get(session.parent)
+      if (list === undefined) childrenOf.set(session.parent, [session.id])
+      else list.push(session.id)
+    }
+  }
+
+  const next = new Set(selected)
+  if (!next.has(id)) {
+    next.add(id)
+    const queue = [id]
+    while (queue.length > 0) {
+      for (const child of childrenOf.get(queue.shift()) ?? []) {
+        next.add(child)
+        queue.push(child)
+      }
+    }
+  } else {
+    next.delete(id)
+    const queue = [id]
+    while (queue.length > 0) {
+      for (const child of childrenOf.get(queue.shift()) ?? []) {
+        next.delete(child)
+        queue.push(child)
+      }
+    }
+    // Un-check every ancestor still selected: keeping one would re-include
+    // this subtree in its deletion closure.
+    let ancestor = parentOf.get(id)
+    while (ancestor !== undefined && next.has(ancestor)) {
+      next.delete(ancestor)
+      ancestor = parentOf.get(ancestor)
+    }
+  }
+  return next
+}
+
 module.exports = function createSettingsTab(React, t, acquire, readFailure) {
   const { useState, useEffect, useMemo } = React
 
@@ -169,13 +225,18 @@ module.exports = function createSettingsTab(React, t, acquire, readFailure) {
     const selectedBytes = selectedSessions.reduce((sum, session) => sum + session.bytes, 0)
 
     const toggle = (id) => {
-      const next = new Set(selected)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      setSelected(next)
+      setSelected(toggleWithDescendants(sessions, selected, id))
     }
     const toggleAll = () => {
-      setSelected(allVisibleSelected ? new Set() : new Set(visible.map((session) => session.id)))
+      if (allVisibleSelected) {
+        setSelected(new Set())
+        return
+      }
+      // Select-each-visible carries each one's descendants in, including
+      // descendants a text filter currently hides from the list.
+      let next = new Set(selected)
+      for (const session of visible) next = toggleWithDescendants(sessions, next, session.id)
+      setSelected(next)
     }
 
     const remove = async () => {
@@ -322,6 +383,10 @@ const childBadgeStyle = Object.freeze({
 })
 const sizeStyle = Object.freeze({ fontSize: '11px', opacity: 0.7, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' })
 
+// Attached after the main export so the factory assignment above cannot
+// overwrite it; the bundle itself only ever uses the factory.
+module.exports.toggleWithDescendants = toggleWithDescendants
+
 return module.exports;
 })();
 __modules["client/client.js"] = (() => {
@@ -359,7 +424,7 @@ const MESSAGES = Object.freeze({
     'service.missing': 'The session-cleaner service did not become reachable. Retry the click; if it persists, reload the page.',
     'service.mountFailed': 'Remote mount failed: {reason}',
     'panel.title': 'Session cleanup',
-    'panel.hint': 'Every session found on disk. Select the ones to remove permanently; a session running in this app cannot be removed and will be refused.',
+    'panel.hint': 'Every session found on disk. Selecting a session also selects its descendant subagent sessions — they are deleted together; a session running in this app cannot be removed and will be refused.',
     'panel.loading': 'Scanning sessions…',
     'panel.retry': 'Retry',
     'panel.search': 'Filter by id, workspace or path',
@@ -390,7 +455,7 @@ const MESSAGES = Object.freeze({
     'service.missing': '会话清理服务未能在 5 秒内就绪。请再点一次「删除会话」；若反复出现，请重新加载页面。',
     'service.mountFailed': 'Remote 契约挂载失败：{reason}',
     'panel.title': '会话清理',
-    'panel.hint': '磁盘上的全部会话。勾选要永久删除的项；本应用中正在运行的会话无法删除，会被拒绝。',
+    'panel.hint': '磁盘上的全部会话。勾选主会话会自动带上其派生的子代理会话（它们会被一并删除）；本应用中正在运行的会话无法删除，会被拒绝。',
     'panel.loading': '正在扫描会话…',
     'panel.retry': '重试',
     'panel.search': '按 id、工作区或路径筛选',

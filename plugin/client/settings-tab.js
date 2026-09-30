@@ -27,6 +27,62 @@ function unwrap(result) {
   return result
 }
 
+/**
+ * One checkbox flip in the panel, kept aligned with the deletion closure:
+ * the Host deletes a session's descendants together with it, so the checked
+ * set (and the "N sessions (X)" totals built from it) must match that
+ * closure exactly.
+ *
+ * - Selecting a session selects its whole descendant subtree.
+ * - Deselecting one drops its subtree AND every selected ancestor: a checked
+ *   ancestor would drag the subtree back into the delete set on the Host
+ *   side, and the panel totals would understate what actually gets removed.
+ *
+ * Children link upward through `parent`; the subtree is walked breadth-first
+ * so grandchildren join even when their parent is missing from the list.
+ */
+function toggleWithDescendants(sessions, selected, id) {
+  const childrenOf = new Map()
+  const parentOf = new Map()
+  for (const session of sessions) {
+    if (session.parent !== undefined) {
+      parentOf.set(session.id, session.parent)
+      const list = childrenOf.get(session.parent)
+      if (list === undefined) childrenOf.set(session.parent, [session.id])
+      else list.push(session.id)
+    }
+  }
+
+  const next = new Set(selected)
+  if (!next.has(id)) {
+    next.add(id)
+    const queue = [id]
+    while (queue.length > 0) {
+      for (const child of childrenOf.get(queue.shift()) ?? []) {
+        next.add(child)
+        queue.push(child)
+      }
+    }
+  } else {
+    next.delete(id)
+    const queue = [id]
+    while (queue.length > 0) {
+      for (const child of childrenOf.get(queue.shift()) ?? []) {
+        next.delete(child)
+        queue.push(child)
+      }
+    }
+    // Un-check every ancestor still selected: keeping one would re-include
+    // this subtree in its deletion closure.
+    let ancestor = parentOf.get(id)
+    while (ancestor !== undefined && next.has(ancestor)) {
+      next.delete(ancestor)
+      ancestor = parentOf.get(ancestor)
+    }
+  }
+  return next
+}
+
 module.exports = function createSettingsTab(React, t, acquire, readFailure) {
   const { useState, useEffect, useMemo } = React
 
@@ -72,13 +128,18 @@ module.exports = function createSettingsTab(React, t, acquire, readFailure) {
     const selectedBytes = selectedSessions.reduce((sum, session) => sum + session.bytes, 0)
 
     const toggle = (id) => {
-      const next = new Set(selected)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      setSelected(next)
+      setSelected(toggleWithDescendants(sessions, selected, id))
     }
     const toggleAll = () => {
-      setSelected(allVisibleSelected ? new Set() : new Set(visible.map((session) => session.id)))
+      if (allVisibleSelected) {
+        setSelected(new Set())
+        return
+      }
+      // Select-each-visible carries each one's descendants in, including
+      // descendants a text filter currently hides from the list.
+      let next = new Set(selected)
+      for (const session of visible) next = toggleWithDescendants(sessions, next, session.id)
+      setSelected(next)
     }
 
     const remove = async () => {
@@ -224,3 +285,7 @@ const childBadgeStyle = Object.freeze({
   background: 'var(--dsw-alias-interactive-bg-hover, light-dark(rgba(38,49,72,.06), rgba(255,255,255,.08)))',
 })
 const sizeStyle = Object.freeze({ fontSize: '11px', opacity: 0.7, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' })
+
+// Attached after the main export so the factory assignment above cannot
+// overwrite it; the bundle itself only ever uses the factory.
+module.exports.toggleWithDescendants = toggleWithDescendants

@@ -323,6 +323,47 @@ test('the confirm dialog renders through the platform Modal and Button pair', as
   assert.equal(actions[1].props.disabled, true)
 })
 
+test('toggling a session carries its descendant subtree along', () => {
+  // The source file is CommonJS living under a "type": "module" package, so
+  // evaluate it in a vm context instead of importing it.
+  const module = { exports: {} }
+  const source = readFileSync(path.resolve(here, '..', 'client', 'settings-tab.js'), 'utf8')
+  vm.runInNewContext(source, { module, exports: module.exports }, { filename: 'settings-tab.js' })
+  const createSettingsTab = module.exports
+  const toggleWithDescendants = module.exports.toggleWithDescendants
+  assert.equal(typeof createSettingsTab, 'function')
+  assert.equal(typeof toggleWithDescendants, 'function')
+
+  // root ── childA ── grandchild
+  //      └─ childB
+  // orphan's parent is gone from the list; unrelated is standalone.
+  const sessions = [
+    { id: 'root' },
+    { id: 'childA', parent: 'root' },
+    { id: 'grandchild', parent: 'childA' },
+    { id: 'childB', parent: 'root' },
+    { id: 'orphan', parent: 'deleted-long-ago' },
+    { id: 'unrelated' },
+  ]
+
+  // Selecting the root selects the whole subtree, two levels deep.
+  const afterAdd = toggleWithDescendants(sessions, new Set(), 'root')
+  assert.deepEqual([...afterAdd].sort(), ['childA', 'childB', 'grandchild', 'root'])
+
+  // Deselecting the root drops the subtree again, leaving others untouched.
+  const afterRemove = toggleWithDescendants(sessions, afterAdd, 'root')
+  assert.deepEqual([...afterRemove], [])
+
+  // Selecting a middle node carries descendants but not the parent.
+  const middle = toggleWithDescendants(sessions, new Set(['unrelated']), 'childA')
+  assert.deepEqual([...middle].sort(), ['childA', 'grandchild', 'unrelated'])
+
+  // Deselecting a middle node drops its subtree and its selected ancestors:
+  // a checked root would drag the subtree back into the deletion closure.
+  const fromParent = toggleWithDescendants(sessions, new Set(['root', 'childA', 'grandchild', 'childB']), 'childA')
+  assert.deepEqual([...fromParent], ['childB'])
+})
+
 test('a failed mount reports its reason instead of a generic missing service', async () => {
   const { React, reactDom } = reactStub()
   const factory = loadFactory()
