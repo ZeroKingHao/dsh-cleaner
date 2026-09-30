@@ -1,0 +1,13 @@
+{
+  "menu.delete": "删除会话",
+  "dialog.title": "永久删除这个会话？",
+  "dialog.body": "会话日志、投影缓存与工作区中的记录都会被移除；由它派生的子代理会话也会一并删除。",
+  "dialog.warning": "此操作不可撤销。DSH 没有回收站，也没有备份。",
+  "dialog.bytes": "将释放 {size}。",
+  "dialog.loading": "正在统计将要删除的内容…",
+  "dialog.confirm": "永久删除",
+  "dialog.cancel": "取消",
+  "dialog.deleting": "正在删除…",
+  "dialog.failed": "删除失败：{reason}",
+  "dialog.running": "该会话正在运行，会先被停止。"
+}

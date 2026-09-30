@@ -1,0 +1,16 @@
+# 沙箱验证数据：含会话日志（可能带真实对话内容），不随仓库分发
+sandbox/
+
+# 截图生成工程文件（渲染脚本与 mock 页面，产物在 plugin/screenshots/）
+.shots/
+
+# DSH 官方包内部文档的本地拷贝（版权属 DeepSeek，不入库；可用 tools/asar-read.mjs 自行提取）
+tools/ws-readme.md
+tools/slots-readme.md
+tools/locale-client.txt
+
+# 本地杂项
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,4 @@
+# Adds only our own plugin row. No official DSH component is replaced.
+- insert:
+    - id: session-cleaner
+      name: dsh-plugin-session-cleaner

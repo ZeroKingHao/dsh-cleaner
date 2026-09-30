@@ -1,0 +1,13 @@
+{
+  "menu.delete": "Delete session",
+  "dialog.title": "Delete this session permanently?",
+  "dialog.body": "The session log, its projection cache and its workspace entry will be removed. Descendant subagent sessions are removed too.",
+  "dialog.warning": "This cannot be undone. DSH keeps no recycle bin and no backup.",
+  "dialog.bytes": "Will free {size}.",
+  "dialog.loading": "Checking what would be removed…",
+  "dialog.confirm": "Delete permanently",
+  "dialog.cancel": "Cancel",
+  "dialog.deleting": "Deleting…",
+  "dialog.failed": "Deletion failed: {reason}",
+  "dialog.running": "This session is running and will be stopped first."
+}
