@@ -118,6 +118,145 @@ export async function readSessionHeader(logFile) {
   }
 }
 
+/** A line longer than this is a streaming carrier, not preview material. */
+const MAX_TRANSCRIPT_LINE_CHARS = 1024 * 1024
+
+/** Cheap pre-filter: only lines naming an event worth keeping get parsed. */
+const TRANSCRIPT_INTEREST = /user\/message|assistant\/message|session\/title|"session"/
+
+/** The zstd frame magic every frame starts with. */
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+
+/**
+ * Decode a multi-frame zstd log.
+ *
+ * DSH appends one zstd frame per writing episode, and BOTH of Node's zstd
+ * APIs decode only the first frame of a file (the streaming decompressor
+ * ends at the first frame boundary too), so the file is split at the frame
+ * magic and every slice decompressed on its own. A magic sequence occurring
+ * inside compressed data — astronomically rare — would slice one real frame
+ * in half; both halves then fail to decode and only that one frame is lost,
+ * which a read-only preview can tolerate (and report).
+ */
+function decodeZstdFrames(buffer) {
+  const offsets = []
+  for (let pos = 0; (pos = buffer.indexOf(ZSTD_MAGIC, pos)) !== -1; pos += 1) offsets.push(pos)
+
+  const chunks = []
+  let failedFrames = 0
+  for (let index = 0; index < offsets.length; index += 1) {
+    const start = offsets[index]
+    const end = index + 1 < offsets.length ? offsets[index + 1] : buffer.length
+    try {
+      chunks.push(zstdDecompressSync(buffer.subarray(start, end)))
+    } catch {
+      failedFrames += 1
+    }
+  }
+  return {
+    text: chunks.length === 0 ? '' : Buffer.concat(chunks).toString('utf8'),
+    decodedFrames: chunks.length,
+    failedFrames,
+  }
+}
+
+/** Join the text blocks of a message content array; reasoning/tool blocks drop. */
+function joinTextBlocks(content) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  const parts = []
+  for (const block of content) {
+    if (block?.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+  }
+  return parts.join('\n\n')
+}
+
+function clampCount(value, fallback) {
+  const count = Math.trunc(Number(value))
+  return Number.isFinite(count) && count > 0 ? count : fallback
+}
+
+/**
+ * Read a session log as a display-oriented conversation transcript.
+ *
+ * Only the events a preview needs are kept: the conversation messages and the
+ * title event (the header's title is usually empty; the real one arrives as
+ * `session/title`). Messages are projected to `{ role, text, time, model? }`:
+ * text blocks are joined, turns without text (pure reasoning, tool calls) and
+ * DSH-injected context events are dropped, and both the message count and the
+ * per-message length are capped so a huge log cannot flood the panel. A
+ * missing log rejects and undecodable frames are reported as `failedFrames`
+ * instead of failing the read.
+ */
+export async function readSessionTranscript(logFile, options = {}) {
+  const maxMessages = clampCount(options.maxMessages, 500)
+  const maxChars = clampCount(options.maxCharsPerMessage, 8000)
+
+  const raw = await readFile(logFile)
+  let text
+  let failedFrames = 0
+  if (logFile.endsWith('.zstd')) {
+    const decoded = decodeZstdFrames(raw)
+    text = decoded.text
+    failedFrames = decoded.failedFrames
+  } else {
+    text = raw.toString('utf8')
+  }
+
+  const collected = []
+  let title
+  let createdAt
+
+  for (const line of text.split('\n')) {
+    if (line.length > MAX_TRANSCRIPT_LINE_CHARS) continue
+    if (!TRANSCRIPT_INTEREST.test(line)) continue
+    let event
+    try { event = JSON.parse(line) } catch { continue }
+
+    if (event?.type === 'session/title') {
+      if (typeof event.data?.title === 'string' && event.data.title.length > 0) title = event.data.title
+    } else if (event?.type === 'session') {
+      const meta = event.meta ?? event.header ?? event
+      if (typeof meta?.createdAt === 'number') createdAt = meta.createdAt
+    } else if (event?.type === 'user/message' || event?.type === 'assistant/message') {
+      const fromUser = event.type === 'user/message'
+      const holder = fromUser ? event.data : (event.data?.message ?? event.data)
+      const textOfMessage = joinTextBlocks(holder?.content)
+      if (textOfMessage.trim() === '') continue
+      const entry = { role: fromUser ? 'user' : 'assistant', text: textOfMessage }
+      if (typeof event.time === 'number') entry.time = event.time
+      if (!fromUser && typeof holder?.source?.model === 'string') entry.model = holder.source.model
+      if (fromUser && holder?.source?.kind !== 'user') entry.injected = true
+      collected.push(entry)
+    }
+  }
+
+  // DSH's runtime-context snapshots and skill catalogs ride user/message
+  // events too, under a source.kind other than 'user'. When a real human
+  // turn exists they are noise; when none does, keep everything — a preview
+  // must never come back empty over a kind-value difference.
+  const hasHumanInput = collected.some((entry) => entry.injected !== true)
+  const kept = hasHumanInput ? collected.filter((entry) => entry.injected !== true) : collected
+
+  const messages = []
+  let truncated = false
+  for (const entry of kept) {
+    if (messages.length >= maxMessages) {
+      truncated = true
+      break
+    }
+    const message = {
+      role: entry.role,
+      text: entry.text.length > maxChars ? `${entry.text.slice(0, maxChars)}…` : entry.text,
+    }
+    if (entry.time !== undefined) message.time = entry.time
+    if (entry.model !== undefined) message.model = entry.model
+    messages.push(message)
+  }
+
+  return { title, createdAt, messages, totalMessages: kept.length, truncated, failedFrames }
+}
+
 /**
  * Index every session directory under `<dshHome>/sessions/<workspaceKey>/<sessionId>/`.
  * The directory listing is the authority: a session unknown to the listing is

@@ -68,6 +68,16 @@ const SESSION_CLEANER_PREVIEW = Object.freeze({
   result: JSON_CODEC,
 })
 
+const SESSION_CLEANER_READ = Object.freeze({
+  id: 'dsh-plugin-session-cleaner#sessionCleaner/read',
+  service: 'sessionCleaner',
+  namespace: 'sessionCleaner',
+  method: 'read',
+  invocation: { kind: 'direct' },
+  parameters: [param('sessionId'), param('options')],
+  result: JSON_CODEC,
+})
+
 const SESSION_CLEANER_DELETE = Object.freeze({
   id: 'dsh-plugin-session-cleaner#sessionCleaner/delete',
   service: 'sessionCleaner',
@@ -80,27 +90,36 @@ const SESSION_CLEANER_DELETE = Object.freeze({
 
 const TYPERT_REMOTE = Object.freeze({
   package: 'dsh-plugin-session-cleaner',
-  descriptors: [SESSION_CLEANER_LIST, SESSION_CLEANER_PREVIEW, SESSION_CLEANER_DELETE],
+  descriptors: [SESSION_CLEANER_LIST, SESSION_CLEANER_PREVIEW, SESSION_CLEANER_READ, SESSION_CLEANER_DELETE],
 })
 
 exports.SESSION_CLEANER_JSON_SCHEMA = SESSION_CLEANER_JSON_SCHEMA
 exports.SESSION_CLEANER_LIST = SESSION_CLEANER_LIST
 exports.SESSION_CLEANER_PREVIEW = SESSION_CLEANER_PREVIEW
+exports.SESSION_CLEANER_READ = SESSION_CLEANER_READ
 exports.SESSION_CLEANER_DELETE = SESSION_CLEANER_DELETE
 exports.TYPERT_REMOTE = TYPERT_REMOTE
 exports.default = TYPERT_REMOTE
 
 return module.exports;
 })();
-__modules["client/settings-tab.js"] = (() => {
+__modules["client/panel-page.js"] = (() => {
 const module = { exports: {} };
 const exports = module.exports;
 /**
- * The Plugins-settings panel: list every session, filter, multi-select, delete.
+ * The global Session-cleanup page: list every session, filter, multi-select,
+ * delete — and preview a conversation before deleting it (a Preview button on
+ * each row, or a double-click anywhere on the row).
  *
- * Registered into `settings.plugins.tab` alongside the session menu row. Both
- * call the same Host service, so the panel adds reach without a second
+ * Registered as a top-level main panel (the `main` keyed slot) with its own
+ * sidebar entry, next to Plugins and Automation Tasks. The session menu row
+ * calls the same Host service, so the page adds reach without a second
  * deletion path.
+ *
+ * The page chrome follows the shipped global pages (ui-schedule, ui-plugin-
+ * manager): a full-height scroll area whose content is centered at 960px with
+ * a page heading; on macOS the heading also yields to the traffic-light
+ * clearance the layout publishes as `--dsh-frame-top-clearance`.
  */
 
 /** Format a byte count for compact display. */
@@ -180,15 +199,60 @@ function toggleWithDescendants(sessions, selected, id) {
   return next
 }
 
-module.exports = function createSettingsTab(React, t, acquire, readFailure) {
-  const { useState, useEffect, useMemo } = React
+// The shipped global pages pad their heading for the macOS traffic lights
+// only ([data-platform='darwin']); on Windows the titlebar already sits above
+// the content area, so the clearance must not be added twice.
+const isDarwin = typeof document === 'object' && document !== null
+  && document.documentElement?.getAttribute?.('data-platform') === 'darwin'
 
-  return function SessionCleanerPanel() {
+/** Locale date-time for a message stamp; '' when the value is not a date. */
+function formatTime(time) {
+  try {
+    const date = new Date(time)
+    if (Number.isNaN(date.getTime())) return ''
+    return date.toLocaleString()
+  } catch {
+    return ''
+  }
+}
+
+/** Render transcript messages as read-only rows (badge, stamp, text). */
+function renderMessages(React, t, messages) {
+  return messages.map((message, index) => {
+    const meta = []
+    if (typeof message.time === 'number') {
+      const stamp = formatTime(message.time)
+      if (stamp !== '') meta.push(stamp)
+    }
+    if (typeof message.model === 'string') meta.push(message.model)
+    return React.createElement('div', { key: index, style: messageStyle }, [
+      React.createElement('div', { key: 'head', style: messageHeadStyle }, [
+        React.createElement('span', {
+          key: 'role',
+          style: message.role === 'assistant' ? assistantBadgeStyle : userBadgeStyle,
+        }, t(message.role === 'assistant' ? 'preview.assistant' : 'preview.user')),
+        meta.length === 0 ? null : React.createElement('span', { key: 'meta', style: messageMetaStyle }, meta.join(' · ')),
+      ]),
+      React.createElement('div', { key: 'text', style: messageTextStyle }, message.text),
+    ])
+  })
+}
+
+module.exports = function createPanelPage(React, t, acquire, readFailure, primitives) {
+  const { useState, useEffect, useMemo, useRef } = React
+  const Modal = primitives?.Modal
+  const Button = primitives?.Button
+
+  return function SessionCleanerPage() {
     const [state, setState] = useState({ phase: 'loading' })
     const [query, setQuery] = useState('')
     const [selected, setSelected] = useState(() => new Set())
     const [busy, setBusy] = useState(false)
     const [notice, setNotice] = useState(undefined)
+    // The pending conversation preview: { phase: 'loading'|'ready'|'error',
+    // sessionId, data?, error? } — undefined while no dialog is open.
+    const [preview, setPreview] = useState(undefined)
+    const previewSeq = useRef(0)
 
     const load = async () => {
       setState({ phase: 'loading' })
@@ -272,80 +336,209 @@ module.exports = function createSettingsTab(React, t, acquire, readFailure) {
       }
     }
 
-    const children = []
-    children.push(React.createElement('h3', { key: 'title', style: headingStyle }, t('panel.title')))
-    children.push(React.createElement('p', { key: 'hint', style: hintStyle }, t('panel.hint')))
+    /**
+     * Open the read-only transcript dialog for a session. Only the most
+     * recent request may settle: a fast double-click on two different rows
+     * would otherwise race, and the older read could overwrite the newer
+     * dialog after it opened.
+     */
+    const openPreview = async (sessionId) => {
+      const requestId = previewSeq.current + 1
+      previewSeq.current = requestId
+      setPreview({ phase: 'loading', sessionId })
+      const service = await acquire()
+      if (previewSeq.current !== requestId) return
+      if (service === undefined) {
+        const reason = readFailure?.()
+        setPreview({ phase: 'error', sessionId, error: reason === undefined ? t('panel.serviceMissing') : t('service.mountFailed', { reason }) })
+        return
+      }
+      try {
+        const data = unwrap(await service.read(sessionId, {}))
+        if (previewSeq.current !== requestId) return
+        if (data?.ok === false) {
+          setPreview({ phase: 'error', sessionId, error: t('preview.failed', { reason: data.error ?? 'unknown' }) })
+        } else {
+          setPreview({ phase: 'ready', sessionId, data })
+        }
+      } catch (reason) {
+        if (previewSeq.current !== requestId) return
+        setPreview({ phase: 'error', sessionId, error: t('preview.failed', { reason: String(reason?.message ?? reason) }) })
+      }
+    }
+
+    const closePreview = () => {
+      previewSeq.current += 1
+      setPreview(undefined)
+    }
+
+    /**
+     * The transcript dialog. The page is a long-lived `main` slot component,
+     * so the dialog can live in its tree directly — unlike the session-menu
+     * rows, whose dialogs must ride the frame-wide `shell.overlay` because
+     * the row unmounts with its menu.
+     */
+    const renderPreview = () => {
+      if (preview === undefined) return null
+      const data = preview.phase === 'ready' ? preview.data : undefined
+
+      const body = []
+      if (data !== undefined) {
+        const meta = [data.workspaceKey, data.humanBytes, data.cwd]
+          .filter((part) => typeof part === 'string' && part !== '')
+        if (meta.length > 0) {
+          body.push(React.createElement('p', { key: 'meta', style: previewMetaStyle }, meta.join(' · ')))
+        }
+        if (data.truncated === true) {
+          body.push(React.createElement('p', { key: 'truncated', style: hintStyle },
+            t('preview.truncated', { shown: data.messages.length, total: data.totalMessages })))
+        }
+        body.push(React.createElement('div', { key: 'messages', style: messageListStyle },
+          data.messages.length === 0
+            ? React.createElement('p', { key: 'empty', style: hintStyle }, t('preview.empty'))
+            : renderMessages(React, t, data.messages)))
+      } else if (preview.phase === 'loading') {
+        body.push(React.createElement('p', { key: 'loading', style: hintStyle }, t('preview.loading')))
+      } else {
+        body.push(React.createElement('p', { key: 'error', style: errorStyle }, preview.error))
+      }
+
+      if (Modal !== undefined && Button !== undefined) {
+        return React.createElement(Modal, {
+          open: true,
+          onClose: closePreview,
+          title: t('preview.title'),
+          closeLabel: t('dialog.close'),
+          description: data?.title || preview.sessionId,
+          footer: React.createElement(Button, { variant: 'outline', onClick: closePreview }, t('dialog.close')),
+        }, body)
+      }
+
+      // Stand-alone fallback (no primitives lane): the hand-rolled card.
+      const rows = [
+        React.createElement('h2', { key: 'title', style: previewHeadingStyle }, t('preview.title')),
+        React.createElement('p', { key: 'subject', style: previewSubjectStyle }, data?.title || preview.sessionId),
+        ...body,
+        React.createElement('div', { key: 'actions', style: actionsStyle },
+          React.createElement('button', { key: 'close', type: 'button', onClick: closePreview, style: buttonStyle }, t('dialog.close'))),
+      ]
+      return React.createElement('div', {
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': t('preview.title'),
+        style: previewOverlayStyle,
+        onClick: (event) => { if (event.target === event.currentTarget) closePreview() },
+      }, React.createElement('div', { style: previewPanelStyle }, rows))
+    }
+
+    const body = []
+    body.push(React.createElement('p', { key: 'hint', style: hintStyle }, t('panel.hint')))
 
     if (state.phase === 'loading') {
-      children.push(React.createElement('p', { key: 'loading', style: hintStyle }, t('panel.loading')))
-      return React.createElement('div', { style: rootStyle }, children)
-    }
-    if (state.phase === 'error') {
-      children.push(React.createElement('p', { key: 'error', style: errorStyle }, state.error))
-      children.push(React.createElement('button', {
+      body.push(React.createElement('p', { key: 'loading', style: hintStyle }, t('panel.loading')))
+    } else if (state.phase === 'error') {
+      body.push(React.createElement('p', { key: 'error', style: errorStyle }, state.error))
+      body.push(React.createElement('button', {
         key: 'retry', type: 'button', onClick: load, style: buttonStyle,
       }, t('panel.retry')))
-      return React.createElement('div', { style: rootStyle }, children)
-    }
-
-    children.push(React.createElement('div', { key: 'toolbar', style: toolbarStyle }, [
-      React.createElement('input', {
-        key: 'query',
-        type: 'search',
-        value: query,
-        placeholder: t('panel.search'),
-        onChange: (event) => setQuery(event.target.value),
-        style: inputStyle,
-      }),
-      React.createElement('button', {
-        key: 'toggle', type: 'button', onClick: toggleAll, style: buttonStyle,
-      }, allVisibleSelected ? t('panel.clear') : t('panel.selectAll')),
-      React.createElement('button', {
-        key: 'delete',
-        type: 'button',
-        disabled: busy || selected.size === 0,
-        onClick: remove,
-        style: selected.size === 0 ? disabledDangerStyle : dangerButtonStyle,
-      }, busy
-        ? t('panel.deleting')
-        : t('panel.delete', { count: selected.size, size: formatBytes(selectedBytes) })),
-    ]))
-
-    if (notice !== undefined) {
-      children.push(React.createElement('p', {
-        key: 'notice',
-        style: notice.kind === 'error' ? errorStyle : doneStyle,
-      }, notice.text))
-    }
-
-    if (visible.length === 0) {
-      children.push(React.createElement('p', { key: 'empty', style: hintStyle }, t('panel.empty')))
     } else {
-      const rows = visible.map((session) => React.createElement('label', {
-        key: session.id,
-        style: rowStyle,
-      }, [
+      body.push(React.createElement('div', { key: 'toolbar', style: toolbarStyle }, [
         React.createElement('input', {
-          key: 'check',
-          type: 'checkbox',
-          checked: selected.has(session.id),
-          onChange: () => toggle(session.id),
+          key: 'query',
+          type: 'search',
+          value: query,
+          placeholder: t('panel.search'),
+          onChange: (event) => setQuery(event.target.value),
+          style: inputStyle,
         }),
-        React.createElement('span', { key: 'id', style: idStyle }, session.id),
-        React.createElement('span', { key: 'ws', style: metaStyle }, session.workspaceKey),
-        session.parent === undefined ? null : React.createElement('span', { key: 'child', style: childBadgeStyle }, t('panel.child')),
-        React.createElement('span', { key: 'size', style: sizeStyle }, session.humanBytes),
+        React.createElement('button', {
+          key: 'toggle', type: 'button', onClick: toggleAll, style: buttonStyle,
+        }, allVisibleSelected ? t('panel.clear') : t('panel.selectAll')),
+        React.createElement('button', {
+          key: 'delete',
+          type: 'button',
+          disabled: busy || selected.size === 0,
+          onClick: remove,
+          style: selected.size === 0 ? disabledDangerStyle : dangerButtonStyle,
+        }, busy
+          ? t('panel.deleting')
+          : t('panel.delete', { count: selected.size, size: formatBytes(selectedBytes) })),
       ]))
-      children.push(React.createElement('div', { key: 'list', style: listStyle }, rows))
+
+      if (notice !== undefined) {
+        body.push(React.createElement('p', {
+          key: 'notice',
+          style: notice.kind === 'error' ? errorStyle : doneStyle,
+        }, notice.text))
+      }
+
+      if (visible.length === 0) {
+        body.push(React.createElement('p', { key: 'empty', style: hintStyle }, t('panel.empty')))
+      } else {
+        const rows = visible.map((session) => React.createElement('label', {
+          key: session.id,
+          style: rowStyle,
+          // A double-click toggles the checkbox twice on the way in (net no
+          // change) and then opens the preview.
+          onDoubleClick: () => { void openPreview(session.id) },
+        }, [
+          React.createElement('input', {
+            key: 'check',
+            type: 'checkbox',
+            checked: selected.has(session.id),
+            onChange: () => toggle(session.id),
+          }),
+          React.createElement('span', { key: 'id', style: idStyle }, session.id),
+          React.createElement('span', { key: 'ws', style: metaStyle }, session.workspaceKey),
+          session.parent === undefined ? null : React.createElement('span', { key: 'child', style: childBadgeStyle }, t('panel.child')),
+          React.createElement('span', { key: 'size', style: sizeStyle }, session.humanBytes),
+          React.createElement('button', {
+            key: 'preview',
+            type: 'button',
+            style: previewButtonStyle,
+            // Inside the row label: without these the click would reach the
+            // label's checkbox instead of the preview.
+            onClick: (event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              void openPreview(session.id)
+            },
+          }, t('panel.preview')),
+        ]))
+        body.push(React.createElement('div', { key: 'list', style: listStyle }, rows))
+      }
+
+      body.push(React.createElement('p', { key: 'root', style: hintStyle }, t('panel.root', { path: state.dshHome ?? '' })))
     }
 
-    children.push(React.createElement('p', { key: 'root', style: hintStyle }, t('panel.root', { path: state.dshHome ?? '' })))
-    return React.createElement('div', { style: rootStyle }, children)
+    return React.createElement('section', { style: pageStyle, 'aria-label': t('panel.title') },
+      React.createElement('div', { style: scrollStyle },
+        React.createElement('div', { style: contentStyle }, [
+          React.createElement('h1', { key: 'title', style: headingStyle }, t('panel.title')),
+          ...body,
+        ])),
+      renderPreview())
   }
 }
 
-const rootStyle = Object.freeze({ display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '13px' })
-const headingStyle = Object.freeze({ margin: '0', fontSize: '14px', fontWeight: 600 })
+const pageStyle = Object.freeze({
+  width: '100%', minWidth: 0, height: '100%', minHeight: 0,
+  display: 'flex', flexDirection: 'column', overflow: 'hidden',
+  background: 'var(--dsw-alias-bg-base, transparent)',
+  color: 'var(--dsw-alias-label-primary, inherit)',
+  fontSize: '14px', lineHeight: '1.6',
+})
+const scrollStyle = Object.freeze({ flex: '1 1 auto', minHeight: 0, overflowY: 'auto', scrollbarGutter: 'stable' })
+const contentStyle = Object.freeze({
+  maxWidth: '960px', margin: '0 auto',
+  padding: '0 clamp(24px, 4vw, 48px) 48px',
+  display: 'flex', flexDirection: 'column', gap: '10px',
+})
+const headingStyle = Object.freeze({
+  margin: '0',
+  fontSize: '20px', fontWeight: 500, lineHeight: '28px',
+  paddingTop: isDarwin ? 'calc(28px + var(--dsh-frame-top-clearance, 0px))' : '28px',
+})
 const hintStyle = Object.freeze({ margin: '0', fontSize: '12px', opacity: 0.7, lineHeight: '18px' })
 const errorStyle = Object.freeze({ margin: '0', fontSize: '12px', color: 'light-dark(#b42318, #ff9c94)', wordBreak: 'break-word' })
 const doneStyle = Object.freeze({ margin: '0', fontSize: '12px', color: 'light-dark(#067647, #75e0a7)' })
@@ -367,12 +560,13 @@ const disabledDangerStyle = Object.freeze({
   ...dangerButtonStyle, opacity: 0.45, cursor: 'not-allowed',
 })
 const listStyle = Object.freeze({
-  display: 'flex', flexDirection: 'column', maxHeight: '320px', overflowY: 'auto',
+  display: 'flex', flexDirection: 'column',
   border: '1px solid var(--dsw-alias-border-l2, light-dark(rgba(0,0,0,.08), rgba(255,255,255,.12)))',
   borderRadius: '10px',
 })
 const rowStyle = Object.freeze({
   display: 'flex', gap: '8px', alignItems: 'center', padding: '6px 10px', cursor: 'pointer',
+  userSelect: 'none',
   borderBottom: '1px solid var(--dsw-alias-border-l1, light-dark(rgba(0,0,0,.05), rgba(255,255,255,.08)))',
 })
 const idStyle = Object.freeze({ flex: '1 1 auto', minWidth: '0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' })
@@ -382,10 +576,54 @@ const childBadgeStyle = Object.freeze({
   background: 'var(--dsw-alias-interactive-bg-hover, light-dark(rgba(38,49,72,.06), rgba(255,255,255,.08)))',
 })
 const sizeStyle = Object.freeze({ fontSize: '11px', opacity: 0.7, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' })
+const previewButtonStyle = Object.freeze({
+  flexShrink: 0, padding: '2px 10px', borderRadius: '6px', font: 'inherit', fontSize: '11px',
+  whiteSpace: 'nowrap', cursor: 'pointer',
+  border: '1px solid var(--dsw-alias-border-l3, light-dark(rgba(0,0,0,.12), rgba(255,255,255,.16)))',
+  background: 'transparent', color: 'inherit',
+})
+const previewOverlayStyle = Object.freeze({
+  position: 'fixed', inset: '0', zIndex: 1000, display: 'flex',
+  alignItems: 'center', justifyContent: 'center',
+  // An overlay host usually disables hit-testing on its container so it cannot
+  // block the app beneath it; the dialog has to opt back in.
+  pointerEvents: 'auto',
+  background: 'light-dark(rgba(15,17,21,.32), rgba(0,0,0,.5))',
+})
+const previewPanelStyle = Object.freeze({
+  minWidth: '380px', maxWidth: '720px', maxHeight: '80vh', display: 'flex', flexDirection: 'column',
+  padding: '20px', borderRadius: '16px',
+  background: 'var(--dsw-alias-bg-module-platform, light-dark(#ffffff, #353638))',
+  color: 'var(--dsw-alias-label-primary, light-dark(#0f1115, #f9fafb))',
+  boxShadow: '0 8px 32px rgba(0,0,0,.24)', font: 'inherit',
+})
+const previewHeadingStyle = Object.freeze({ margin: '0 0 8px', fontSize: '15px', fontWeight: 600 })
+const previewSubjectStyle = Object.freeze({ margin: '0 0 12px', fontSize: '13px', opacity: 0.75, wordBreak: 'break-all' })
+const previewMetaStyle = Object.freeze({ margin: '0 0 8px', fontSize: '12px', opacity: 0.7, wordBreak: 'break-all' })
+const messageListStyle = Object.freeze({
+  display: 'flex', flexDirection: 'column', gap: '12px',
+  maxHeight: '60vh', overflowY: 'auto', padding: '2px',
+})
+const messageStyle = Object.freeze({ display: 'flex', flexDirection: 'column', gap: '4px' })
+const messageHeadStyle = Object.freeze({ display: 'flex', gap: '8px', alignItems: 'baseline' })
+const messageMetaStyle = Object.freeze({ fontSize: '11px', opacity: 0.55, whiteSpace: 'nowrap' })
+const userBadgeStyle = Object.freeze({
+  fontSize: '10px', padding: '1px 6px', borderRadius: '999px', whiteSpace: 'nowrap',
+  background: 'light-dark(rgba(38,49,72,.08), rgba(255,255,255,.14))',
+})
+const assistantBadgeStyle = Object.freeze({
+  fontSize: '10px', padding: '1px 6px', borderRadius: '999px', whiteSpace: 'nowrap',
+  background: 'light-dark(rgba(12,123,220,.14), rgba(56,132,255,.24))',
+})
+const messageTextStyle = Object.freeze({
+  fontSize: '13px', lineHeight: '1.6', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+})
+const actionsStyle = Object.freeze({ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '16px' })
 
 // Attached after the main export so the factory assignment above cannot
 // overwrite it; the bundle itself only ever uses the factory.
 module.exports.toggleWithDescendants = toggleWithDescendants
+module.exports.renderMessages = renderMessages
 
 return module.exports;
 })();
@@ -397,6 +635,9 @@ const exports = module.exports;
  *
  * Adds a "delete session" row to the sidebar Session menu — the one place a
  * user already looks for per-session actions — and confirms before deleting.
+ * It also contributes a top-level Session-cleanup page (sidebar entry next to
+ * Plugins and Automation Tasks) for listing and batch-deleting every session
+ * on disk.
  *
  * The Host half owns deletion; this file only presents it. DSH's client module
  * system loads one self-contained bundle and hands it a `require`, so React and
@@ -405,7 +646,15 @@ const exports = module.exports;
  */
 
 const { TYPERT_REMOTE } = __modules["src/contract.cjs"]
-const createSettingsTab = __modules["client/settings-tab.js"]
+const createPanelPage = __modules["client/panel-page.js"]
+
+/**
+ * The panel id. It addresses both the `main` keyed-slot entry (the page) and
+ * the `sidebar.panellist` entry (the row that selects it): the layout's
+ * `selectPanel(id)` resolves the same key, so the two must never diverge.
+ * The shipped pages use "plugins" (order 0) and "schedules" (order 10).
+ */
+const PANEL_ID = 'session-cleaner'
 
 const MESSAGES = Object.freeze({
   en: Object.freeze({
@@ -423,8 +672,9 @@ const MESSAGES = Object.freeze({
     'dialog.failed': 'Deletion failed: {reason}',
     'service.missing': 'The session-cleaner service did not become reachable. Retry the click; if it persists, reload the page.',
     'service.mountFailed': 'Remote mount failed: {reason}',
+    'panel.nav': 'Session cleanup',
     'panel.title': 'Session cleanup',
-    'panel.hint': 'Every session found on disk. Selecting a session also selects its descendant subagent sessions — they are deleted together; a session running in this app cannot be removed and will be refused.',
+    'panel.hint': 'Every session found on disk. Selecting a session also selects its descendant subagent sessions — they are deleted together; a session running in this app cannot be removed and will be refused. Double-click a row (or use its Preview button) to read the conversation before deleting.',
     'panel.loading': 'Scanning sessions…',
     'panel.retry': 'Retry',
     'panel.search': 'Filter by id, workspace or path',
@@ -436,8 +686,16 @@ const MESSAGES = Object.freeze({
     'panel.failed': 'Deletion failed: {reason}',
     'panel.empty': 'No session matches the filter.',
     'panel.child': 'subagent',
+    'panel.preview': 'Preview',
     'panel.root': 'Data root: {path}',
     'panel.serviceMissing': 'The session-cleaner service is unavailable. Check the network panel and reload the page.',
+    'preview.title': 'Conversation preview',
+    'preview.loading': 'Reading the conversation…',
+    'preview.empty': 'No text messages in this session.',
+    'preview.truncated': 'Showing the first {shown} of {total} messages.',
+    'preview.failed': 'Failed to read the conversation: {reason}',
+    'preview.user': 'User',
+    'preview.assistant': 'Assistant',
   }),
   zh: Object.freeze({
     'menu.delete': '删除会话',
@@ -454,8 +712,9 @@ const MESSAGES = Object.freeze({
     'dialog.failed': '删除失败：{reason}',
     'service.missing': '会话清理服务未能在 5 秒内就绪。请再点一次「删除会话」；若反复出现，请重新加载页面。',
     'service.mountFailed': 'Remote 契约挂载失败：{reason}',
+    'panel.nav': '会话清理',
     'panel.title': '会话清理',
-    'panel.hint': '磁盘上的全部会话。勾选主会话会自动带上其派生的子代理会话（它们会被一并删除）；本应用中正在运行的会话无法删除，会被拒绝。',
+    'panel.hint': '磁盘上的全部会话。勾选主会话会自动带上其派生的子代理会话（它们会被一并删除）；本应用中正在运行的会话无法删除，会被拒绝。双击会话行（或点「预览」）可先查看对话内容再决定删除。',
     'panel.loading': '正在扫描会话…',
     'panel.retry': '重试',
     'panel.search': '按 id、工作区或路径筛选',
@@ -467,8 +726,16 @@ const MESSAGES = Object.freeze({
     'panel.failed': '删除失败：{reason}',
     'panel.empty': '没有符合条件的会话。',
     'panel.child': '子代理',
+    'panel.preview': '预览',
     'panel.root': '数据根目录：{path}',
     'panel.serviceMissing': '会话清理服务不可用。请检查连接后重新加载页面。',
+    'preview.title': '对话预览',
+    'preview.loading': '正在读取会话内容…',
+    'preview.empty': '此会话没有可显示的文本消息。',
+    'preview.truncated': '仅显示前 {shown} 条消息（共 {total} 条）。',
+    'preview.failed': '读取会话失败：{reason}',
+    'preview.user': '用户',
+    'preview.assistant': '助手',
   }),
 })
 
@@ -856,19 +1123,43 @@ module.exports = function createPlugin(require) {
           id: 'session-cleaner.confirm',
           order: 90,
         }, ConfirmDialog))
-      } catch { /* no overlay host in this composition: deletion stays available through the settings tab */ }
+      } catch { /* no overlay host in this composition: deletion stays available through the panel page */ }
+
+      /**
+       * The sidebar glyph for the panel entry. The sidebar shell renders the
+       * row itself — button, tooltip, label, selected state — and hands the
+       * entry `{ size, active }`. The same trash glyph the menu row uses
+       * keeps the two entries recognizable as one feature.
+       */
+      function PanelIcon({ size }) {
+        if (IconTrashOutlineRegular === undefined) return null
+        return React.createElement(IconTrashOutlineRegular, { size })
+      }
 
       try {
-        // A `label` thunk is re-read on every projection, so the tab text
-        // follows a live locale change without re-registering.
-        const panel = createSettingsTab(React, t, acquire, readFailure)
-        ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
-          name: 'settings.plugins.tab',
-          id: 'session-cleaner',
-          order: 200,
-          label: () => t('panel.title'),
-        }, panel))
-      } catch { /* the settings section may not be mounted in this build */ }
+        // The page itself: a `main` keyed-slot entry under the panel id, next
+        // to the shipped Plugins and Automation Tasks pages. `selectPanel(id)`
+        // dispatches on this key, so a missing entry would make the sidebar
+        // row throw on click — the two registrations below are one unit.
+        const page = createPanelPage(React, t, acquire, readFailure, { Modal, Button })
+        ctx.slots.inject('main', () => ctx.slots.register({
+          name: 'main',
+          key: PANEL_ID,
+        }, page))
+      } catch { /* the layout panel seat is optional in this composition */ }
+
+      try {
+        // The sidebar entry, at the same level as Plugins (order 0) and
+        // Automation Tasks (order 10). A `label` thunk is re-read on every
+        // projection, so the row text follows a live locale change without
+        // re-registering.
+        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+          name: 'sidebar.panellist',
+          id: PANEL_ID,
+          order: 20,
+          label: () => t('panel.nav'),
+        }, PanelIcon))
+      } catch { /* without the sidebar list the page stays reachable through the menu rows */ }
     },
   }
 }

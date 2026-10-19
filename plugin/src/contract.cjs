@@ -62,6 +62,16 @@ const SESSION_CLEANER_PREVIEW = Object.freeze({
   result: JSON_CODEC,
 })
 
+const SESSION_CLEANER_READ = Object.freeze({
+  id: 'dsh-plugin-session-cleaner#sessionCleaner/read',
+  service: 'sessionCleaner',
+  namespace: 'sessionCleaner',
+  method: 'read',
+  invocation: { kind: 'direct' },
+  parameters: [param('sessionId'), param('options')],
+  result: JSON_CODEC,
+})
+
 const SESSION_CLEANER_DELETE = Object.freeze({
   id: 'dsh-plugin-session-cleaner#sessionCleaner/delete',
   service: 'sessionCleaner',
@@ -74,12 +84,13 @@ const SESSION_CLEANER_DELETE = Object.freeze({
 
 const TYPERT_REMOTE = Object.freeze({
   package: 'dsh-plugin-session-cleaner',
-  descriptors: [SESSION_CLEANER_LIST, SESSION_CLEANER_PREVIEW, SESSION_CLEANER_DELETE],
+  descriptors: [SESSION_CLEANER_LIST, SESSION_CLEANER_PREVIEW, SESSION_CLEANER_READ, SESSION_CLEANER_DELETE],
 })
 
 exports.SESSION_CLEANER_JSON_SCHEMA = SESSION_CLEANER_JSON_SCHEMA
 exports.SESSION_CLEANER_LIST = SESSION_CLEANER_LIST
 exports.SESSION_CLEANER_PREVIEW = SESSION_CLEANER_PREVIEW
+exports.SESSION_CLEANER_READ = SESSION_CLEANER_READ
 exports.SESSION_CLEANER_DELETE = SESSION_CLEANER_DELETE
 exports.TYPERT_REMOTE = TYPERT_REMOTE
 exports.default = TYPERT_REMOTE

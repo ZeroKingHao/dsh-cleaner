@@ -25,12 +25,12 @@ DSH 本身没有任何删除会话的途径：`sessionPersistence` 只有 `creat
 
 ![删除前的确认弹窗](screenshots/confirm-dialog.png)
 
-![设置 → 插件中的批量清理面板](screenshots/settings-panel.png)
+![侧边栏「会话清理」面板中的批量清理页面](screenshots/settings-panel.png)
 
 ## 三个入口
 
 1. **侧边栏 · 会话「…」菜单 → 「删除会话」**（排在官方「归档」之后，order 500）。点击后弹确认框，显示会话标题、将要释放的空间、以及是否包含派生子代理会话。
-2. **设置 → 插件 → 「会话清理」页**：列出磁盘上的全部会话（id / 工作区 / 大小，子代理会话带标记），支持按 id、工作区或路径筛选，全选后批量删除，删除前列出数量与总大小再确认。勾选主会话会自动带上其派生的子代理会话（Host 删除时它们本就会一并删除，勾选集合与实际删除闭包保持一致，取消勾选同理向上传播）。
+2. **侧边栏 · 「会话清理」页**（与「插件」「自动化任务」同级的全局面板）：列出磁盘上的全部会话（id / 工作区 / 大小，子代理会话带标记），支持按 id、工作区或路径筛选，全选后批量删除，删除前列出数量与总大小再确认。勾选主会话会自动带上其派生的子代理会话（Host 删除时它们本就会一并删除，勾选集合与实际删除闭包保持一致，取消勾选同理向上传播）。**双击会话行或点行内「预览」按钮可先查看对话内容**：标题、双方消息与模型名（Remote `read` 方法解码多帧 zstd 日志并过滤 DSH 注入的运行时上下文，只读、不改动任何数据）。
 3. **模型 Tool `session_delete`**：默认 `dryRun: true` 只列清单，必须显式传 `dryRun: false` 才真删。
 
 ## 安全设计
@@ -64,7 +64,7 @@ DSH 的 profile 使用 pnpm 的 `file:` 依赖 + `dsh.profile.bundles` 声明：
 node build/client.mjs                          # 构建 lib/
 node --test tests/cleaner.test.mjs \
            tests/plugin.test.mjs \
-           tests/client.test.mjs               # 31 个测试
+           tests/client.test.mjs               # 51 个测试
 ```
 
 `build/client.mjs` 是一个零依赖的极简打包器：DSH 的客户端模块系统每个包只加载**一个自包含的 `client.js`**（entry 与 chunk 之间不能同步 require 另一个相对 `client*.js`），所以相对 require 被内联，React / react-dom 则保留为平台模块请求，由 shell 冻结的模块表应答。
@@ -178,12 +178,12 @@ Host 把每个包的 `dsh.client` 元数据缓存在内存里**直到重启**；
 ```
 plugin/
 ├─ src/
-│  ├─ cleaner.js      纯逻辑：扫描、级联展开、路径校验、注册表摘除、计划与执行
-│  ├─ index.js        Host 插件：服务、Remote 绑定、Tool 注册、会话停止
+│  ├─ cleaner.js      纯逻辑：扫描、级联展开、路径校验、注册表摘除、对话转录、计划与执行
+│  ├─ index.js        Host 插件：服务（list / preview / read / delete）、Remote 绑定、Tool 注册、会话停止
 │  ├─ contract.cjs    Remote 契约（CJS，两半共用，strict 编解码器）
 │  ├─ typert.host.js  typert 严格反射（typert-loader 按 ./typert 约定加载）
 │  └─ remote.js       Host 侧的契约入口
-├─ client/            Web 客户端源码（菜单项 + 确认弹窗 + 设置页批量面板）
+├─ client/            Web 客户端源码（菜单项 + 确认弹窗 + 全局面板页）
 ├─ build/client.mjs   构建（lib/ 转发 + 客户端单文件打包）
 ├─ lib/               构建产物
 ├─ locale/            中英文案

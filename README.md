@@ -8,17 +8,18 @@ DSH 本身没有任何删除会话的途径：会话只能归档，官方文档�
 
 ![删除前的确认弹窗](plugin/screenshots/confirm-dialog.png)
 
-![设置 → 插件中的批量清理面板](plugin/screenshots/settings-panel.png)
+![侧边栏「会话清理」面板中的批量清理页面](plugin/screenshots/settings-panel.png)
 
 *以上为示意图（演示数据）。*
 
 ## 功能
 
-- **三个入口**：侧边栏会话「⋯」菜单 → 删除会话（带确认弹窗）；设置 → 插件 → 会话清理（全盘列表 + 筛选 + 批量删除）；模型 Tool `session_delete`（默认 dry-run）。
+- **三个入口**：侧边栏会话「⋯」菜单 → 删除会话（带确认弹窗）；侧边栏「会话清理」页面（与「插件」「自动化任务」同级的全局面板：全盘列表 + 筛选 + 批量删除）；模型 Tool `session_delete`（默认 dry-run）。
+- **对话预览**：清理面板中双击会话行或点行内「预览」按钮，即可在删除前查看该会话的对话内容（标题、双方消息与模型名；自动过滤 DSH 注入的运行时上下文等系统内容，多帧 zstd 日志完整解码）。
 - **级联清理**：删除主会话时，由它派生的全部子代理会话一并删除（含多级）。
 - **勾选即删除闭包**：批量面板勾选主会话会自动带上其子代理，选中数量与释放空间和实际删除完全一致。
 - **安全设计**：三重路径校验、运行中的会话先停止再删、当前打开的会话拒绝删除、不可撤销操作前明确确认。
-- **界面与宿主一致**：菜单行、确认弹窗、设置面板全部使用 DSH 官方 primitives 组件渲染。
+- **界面与宿主一致**：菜单行、确认弹窗、预览弹窗、设置面板全部使用 DSH 官方 primitives 组件渲染。
 
 ## 安装
 
@@ -51,10 +52,10 @@ DSH 的 profile 使用 pnpm 的 `file:` 依赖声明：
 node build/client.mjs                          # 构建 lib/
 node --test tests/cleaner.test.mjs \
            tests/plugin.test.mjs \
-           tests/client.test.mjs               # 35 个测试
+           tests/client.test.mjs               # 51 个测试
 ```
 
-零运行时依赖，离线可构建。插件分两半：Host 侧（服务、Remote 契约、模型 Tool）与 Web 客户端侧（菜单项、确认弹窗、设置面板），共用同一份 strict 编解码契约。
+零运行时依赖，离线可构建。插件分两半：Host 侧（服务、Remote 契约、模型 Tool）与 Web 客户端侧（菜单项、确认弹窗、全局面板页），共用同一份 strict 编解码契约。
 
 完整文档——包括 DSH 客户端插件开发的**踩坑记录**（Cordis 服务注入、Remote namespace 组合键、官方 primitives 组件、slot props 约定等）——见 [plugin/README.md](plugin/README.md)。
 

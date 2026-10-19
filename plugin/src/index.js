@@ -16,7 +16,7 @@
  * never activates. Everything it needs arrives through the Cordis context.
  */
 
-import { executeDeletion, findSearchIndexes, isValidSessionId, planDeletion, resolveDshHome, rootsFor, scanSessions } from './cleaner.js'
+import { executeDeletion, findSearchIndexes, isValidSessionId, planDeletion, readSessionTranscript, resolveDshHome, rootsFor, scanSessions } from './cleaner.js'
 
 export const name = 'sessionCleaner'
 export const inject = ['tools', 'agents']
@@ -169,6 +169,40 @@ function createService(ctx) {
     async preview(sessionIds) {
       const planned = await planDeletion(roots, Array.isArray(sessionIds) ? sessionIds : [])
       return { ...planToWire(planned), note: RESTORE_NOTE }
+    },
+
+    /**
+     * Read one session's conversation as a read-only transcript preview.
+     * Locating the log reuses the scan, so the id grammar and path
+     * containment checks guarding deletion guard the read too.
+     */
+    async read(sessionId, options = {}) {
+      if (!isValidSessionId(sessionId)) {
+        return { ok: false, error: 'not a valid session id' }
+      }
+      const { records } = await scanSessions(roots)
+      const record = records.get(sessionId)
+      if (record === undefined) {
+        return { ok: false, error: 'session not found on disk' }
+      }
+      try {
+        const transcript = await readSessionTranscript(record.logFile, options)
+        return {
+          ok: true,
+          id: record.id,
+          workspaceKey: record.workspaceKey,
+          cwd: record.cwd,
+          bytes: record.bytes,
+          humanBytes: formatBytes(record.bytes),
+          title: transcript.title ?? record.title,
+          createdAt: transcript.createdAt,
+          messages: transcript.messages,
+          totalMessages: transcript.totalMessages,
+          truncated: transcript.truncated,
+        }
+      } catch (error) {
+        return { ok: false, error: `failed to read the session log: ${String(error?.message ?? error)}` }
+      }
     },
 
     /**

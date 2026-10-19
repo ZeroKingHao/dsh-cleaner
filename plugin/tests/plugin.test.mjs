@@ -63,7 +63,7 @@ test('apply() publishes the service, mounts Remote and registers the Tool', asyn
   // The service the Web client and the Tool both call.
   const service = provided.get('sessionCleaner')
   assert.ok(service !== undefined, 'the sessionCleaner service must be provided')
-  for (const method of ['list', 'preview', 'delete']) {
+  for (const method of ['list', 'preview', 'read', 'delete']) {
     assert.equal(typeof service[method], 'function', `service.${method} must exist`)
   }
   assert.ok(service.typertRemote !== undefined, 'the Remote binding must be attached')
@@ -184,6 +184,24 @@ test('preview reports the data root and never deletes', async () => {
   assert.equal(preview.targetCount, 0, 'an unknown session has nothing to delete')
   assert.match(preview.note, /permanent/i)
   assert.ok(Array.isArray(preview.registryChanges))
+})
+
+test('read refuses invalid or unknown session ids without touching a log', async () => {
+  const { ctx, provided } = makeContext()
+  plugin.apply(ctx)
+  const service = provided.get('sessionCleaner')
+
+  for (const id of ['not-a-session', '../../etc', undefined, null]) {
+    const result = await service.read(id)
+    assert.equal(result.ok, false, `must refuse: ${String(id)}`)
+    assert.match(result.error, /not a valid session id/)
+  }
+
+  // A well-formed id that is absent from disk: the scan locates logs, so an
+  // unknown id is refused before any file is opened.
+  const missing = await service.read('session-aaaaaaaa-1111-2222-3333-444444444444')
+  assert.equal(missing.ok, false)
+  assert.match(missing.error, /not found/)
 })
 
 test('unregistering the effect removes the Tool', () => {

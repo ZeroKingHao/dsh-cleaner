@@ -41,8 +41,64 @@ function reactStub() {
     useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
     useEffect: (effect) => { effect() },
     useRef: (initial) => ({ current: initial }),
+    useMemo: (factory) => factory(),
   }
   return { React, reactDom: { createPortal: (node) => node } }
+}
+
+/**
+ * A React stub with REAL hook state: setters update a shared slot store, and
+ * the test re-invokes the component to observe the next state — enough to
+ * walk the panel through its loading → ready → preview-open states. Effects
+ * run once: the page's only effect is mount-only.
+ */
+function statefulReactStub() {
+  const slots = []
+  const state = { cursor: 0, effectsRun: false }
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    Fragment: Symbol('Fragment'),
+    useState(initial) {
+      const slot = state.cursor
+      state.cursor += 1
+      if (!(slot in slots)) slots[slot] = typeof initial === 'function' ? initial() : initial
+      return [slots[slot], (value) => { slots[slot] = typeof value === 'function' ? value(slots[slot]) : value }]
+    },
+    useEffect: (effect) => {
+      if (!state.effectsRun) {
+        state.effectsRun = true
+        effect()
+      }
+    },
+    useRef: (initial) => ({ current: initial }),
+    useMemo: (factory) => factory(),
+  }
+  const render = (component, props = {}) => {
+    state.cursor = 0
+    return component(props)
+  }
+  return { React, render }
+}
+
+/** Collect every element node in a stub-rendered tree. */
+function collect(node, found = []) {
+  if (node === null || typeof node !== 'object') return found
+  if (Array.isArray(node)) {
+    for (const child of node) collect(child, found)
+    return found
+  }
+  if (typeof node.type === 'string' || typeof node.type === 'symbol') {
+    found.push(node)
+    collect(node.children, found)
+  }
+  return found
+}
+
+/** Let the stubbed async chains (mount, inject, list, read) settle. */
+const settle = async (rounds = 4) => {
+  for (let index = 0; index < rounds; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
 }
 
 test('the bundle is a factory that returns a Cordis plugin', () => {
@@ -86,26 +142,36 @@ test('the factory registers a delete row in the session menu slot', async () => 
 
   plugin.apply(ctx)
 
-  // Three slots are contributed: the session menu row, the frame-wide confirm
-  // dialog and the settings panel.
+  // Four slots are contributed: the session menu row, the frame-wide confirm
+  // dialog, the global cleanup page and its sidebar entry.
   assert.deepEqual(injections, [
     'sidebar.workspaces.session.menu.item',
     'shell.overlay',
-    'settings.plugins.tab',
+    'main',
+    'sidebar.panellist',
   ])
-  assert.equal(registrations.length, 3)
+  assert.equal(registrations.length, 4)
 
   const menu = registrations.find((entry) => entry.options.name === 'sidebar.workspaces.session.menu.item')
   assert.equal(menu.options.id, 'session-cleaner.delete', 'a fresh id must not shadow a shipped row')
   assert.equal(menu.options.order, 500, 'must sort after the shipped archive row (400)')
   assert.equal(typeof menu.component, 'function')
 
-  const tab = registrations.find((entry) => entry.options.name === 'settings.plugins.tab')
-  assert.equal(tab.options.id, 'session-cleaner')
-  assert.equal(typeof tab.component, 'function')
-  // A label thunk keeps the tab text following the live locale.
-  assert.equal(typeof tab.options.label, 'function')
-  assert.equal(tab.options.label(), '会话清理')
+  const panel = registrations.find((entry) => entry.options.name === 'sidebar.panellist')
+  assert.equal(panel.options.id, 'session-cleaner')
+  // Same level as the shipped rows: Plugins sits at order 0, Automation
+  // Tasks at 10 — the cleanup panel sorts right after them.
+  assert.equal(panel.options.order, 20)
+  assert.equal(typeof panel.component, 'function')
+  // A label thunk keeps the row text following the live locale.
+  assert.equal(typeof panel.options.label, 'function')
+  assert.equal(panel.options.label(), '会话清理')
+
+  const page = registrations.find((entry) => entry.options.name === 'main')
+  // The sidebar row selects the page by panel id, resolved as the main-slot
+  // key: a diverging key would make selectPanel throw and keep the row dead.
+  assert.equal(page.options.key, panel.options.id)
+  assert.equal(typeof page.component, 'function')
 })
 
 test('the row renders a menu item and tolerates a missing host service', async () => {
@@ -202,7 +268,7 @@ test('acquire mounts once and reads the namespace under its composed property ke
   await new Promise((resolve) => setImmediate(resolve))
 
   assert.equal(mounts.length, 1, 'exactly one $mount may be issued')
-  assert.equal(mounts[0].descriptors.length, 3)
+  assert.equal(mounts[0].descriptors.length, 4)
   // The dependency array was created inside the vm sandbox, so expand it into
   // a host-realm array before deep comparison (cross-realm Array prototypes
   // never compare equal).
@@ -323,15 +389,171 @@ test('the confirm dialog renders through the platform Modal and Button pair', as
   assert.equal(actions[1].props.disabled, true)
 })
 
+test('the sidebar entry renders the trash glyph at the size the row hands it', async () => {
+  const { React, reactDom } = reactStub()
+  const primitives = {
+    IconTrashOutlineRegular: (props) => ({ type: 'IconTrashOutlineRegular', props }),
+  }
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return reactDom
+    if (id === '@deepseek-ai/dsh-client-ui-primitives') return primitives
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  let component
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) {
+        if (options.name === 'sidebar.panellist') component = value
+      },
+    },
+  })
+
+  // The sidebar hands `{ size, active }`; the glyph forwards the size so the
+  // row stays metrically identical to the shipped entries.
+  const glyph = component({ size: 18, active: false })
+  assert.equal(glyph.type, primitives.IconTrashOutlineRegular)
+  assert.equal(glyph.props.size, 18)
+})
+
+test('the cleanup page renders the global-page chrome with a level-1 heading', async () => {
+  const { React, reactDom } = reactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return reactDom
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  let component
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) {
+        if (options.name === 'main') component = value
+      },
+    },
+  })
+
+  // The stub runs effects synchronously; acquire resolves to undefined (no
+  // remote in this ctx), so the page settles on its service-missing state —
+  // which still has to carry the page shell and heading.
+  const rendered = component({})
+  assert.equal(rendered.type, 'section')
+  assert.equal(rendered.props['aria-label'], 'Session cleanup')
+  const scroll = rendered.children[0]
+  const content = scroll.children[0]
+  // The content div receives its children as one array argument, which the
+  // stub preserves as a nested array.
+  const heading = content.children[0][0]
+  assert.equal(heading.type, 'h1')
+  assert.deepEqual(heading.children, ['Session cleanup'])
+})
+
+test('the cleanup page opens a conversation preview from a row', async () => {
+  const { React, render } = statefulReactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return { createPortal: (node) => node }
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const USER = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const readCalls = []
+  const service = {
+    list: async () => ({
+      sessions: [{
+        id: USER, workspaceKey: '--ws--', bytes: 10, humanBytes: '10 B',
+        parent: undefined, cwd: 'F:\\x', title: undefined,
+      }],
+    }),
+    read: async (sessionId, options) => {
+      readCalls.push([sessionId, options])
+      return {
+        ok: true, id: sessionId, workspaceKey: '--ws--', cwd: 'F:\\x',
+        bytes: 10, humanBytes: '10 B', title: 'A titled conversation',
+        createdAt: 1790000000000, messages: [
+          { role: 'user', text: 'hello', time: 1790000001000 },
+          { role: 'assistant', text: 'hi', time: 1790000002000, model: 'deepseek-flash' },
+        ],
+        totalMessages: 2, truncated: false,
+      }
+    },
+  }
+  let component
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback({ 'remote.sessionCleaner': service }) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) {
+        if (options.name === 'main') component = value
+      },
+    },
+  })
+
+  // The first render mounts and starts loading; after the settle the second
+  // render shows the row list.
+  render(component)
+  await settle()
+  const ready = render(component)
+  const labels = collect(ready).filter((node) => node.type === 'label')
+  assert.equal(labels.length, 1)
+  assert.equal(typeof labels[0].props.onDoubleClick, 'function', 'a row double-click opens the preview')
+
+  const previewButton = collect(labels[0]).find(
+    (node) => node.type === 'button' && node.children.flat().includes('Preview'))
+  assert.notEqual(previewButton, undefined, 'each row carries a preview button')
+  await previewButton.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await settle()
+  // The arguments were created inside the vm sandbox; expand them into
+  // host-realm values before comparing (cross-realm prototypes never equal).
+  assert.equal(readCalls.length, 1)
+  assert.equal(readCalls[0][0], USER)
+  assert.deepEqual({ ...readCalls[0][1] }, {}, 'the button reaches the Host read with empty options')
+
+  // The settled third render shows the dialog (no primitives lane: the
+  // hand-rolled overlay card).
+  const withDialog = render(component)
+  const dialog = collect(withDialog).find((node) => node.props?.role === 'dialog')
+  assert.notEqual(dialog, undefined)
+  assert.equal(dialog.props['aria-label'], 'Conversation preview')
+  const paragraphs = collect(withDialog)
+    .filter((node) => node.type === 'p')
+    .map((node) => node.children.flat().join(''))
+  assert.ok(paragraphs.some((text) => text.includes('A titled conversation')), 'the title from the log is shown')
+  assert.ok(paragraphs.some((text) => text.includes('--ws--')), 'the workspace key is shown')
+  const messageTexts = collect(withDialog)
+    .filter((node) => node.type === 'div' && node.props?.key === 'text')
+    .map((node) => node.children.flat().join(''))
+  assert.deepEqual(messageTexts, ['hello', 'hi'], 'both sides of the conversation are rendered')
+
+  // Closing drops the dialog; a double-click reopens it through the same read.
+  const closeButton = collect(withDialog).find(
+    (node) => node.type === 'button' && node.children.flat().includes('Close'))
+  closeButton.props.onClick()
+  assert.equal(collect(render(component)).find((node) => node.props?.role === 'dialog'), undefined)
+  await labels[0].props.onDoubleClick()
+  await settle()
+  assert.equal(readCalls.length, 2, 'a row double-click reads the transcript too')
+})
+
 test('toggling a session carries its descendant subtree along', () => {
   // The source file is CommonJS living under a "type": "module" package, so
   // evaluate it in a vm context instead of importing it.
   const module = { exports: {} }
-  const source = readFileSync(path.resolve(here, '..', 'client', 'settings-tab.js'), 'utf8')
-  vm.runInNewContext(source, { module, exports: module.exports }, { filename: 'settings-tab.js' })
-  const createSettingsTab = module.exports
+  const source = readFileSync(path.resolve(here, '..', 'client', 'panel-page.js'), 'utf8')
+  vm.runInNewContext(source, { module, exports: module.exports, document: undefined }, { filename: 'panel-page.js' })
+  const createPanelPage = module.exports
   const toggleWithDescendants = module.exports.toggleWithDescendants
-  assert.equal(typeof createSettingsTab, 'function')
+  assert.equal(typeof createPanelPage, 'function')
   assert.equal(typeof toggleWithDescendants, 'function')
 
   // root ── childA ── grandchild
@@ -362,6 +584,36 @@ test('toggling a session carries its descendant subtree along', () => {
   // a checked root would drag the subtree back into the deletion closure.
   const fromParent = toggleWithDescendants(sessions, new Set(['root', 'childA', 'grandchild', 'childB']), 'childA')
   assert.deepEqual([...fromParent], ['childB'])
+})
+
+test('renderMessages lays out both sides of a transcript', () => {
+  // The source file is CommonJS living under a "type": "module" package, so
+  // evaluate it in a vm context instead of importing it.
+  const module = { exports: {} }
+  const source = readFileSync(path.resolve(here, '..', 'client', 'panel-page.js'), 'utf8')
+  vm.runInNewContext(source, { module, exports: module.exports, document: undefined }, { filename: 'panel-page.js' })
+  const renderMessages = module.exports.renderMessages
+  assert.equal(typeof renderMessages, 'function')
+
+  const { React } = reactStub()
+  const rows = renderMessages(React, (key) => key, [
+    { role: 'user', text: 'hello' },
+    { role: 'assistant', text: 'hi', time: 1790000002000, model: 'deepseek-flash' },
+  ])
+  assert.equal(rows.length, 2)
+
+  // The stub preserves a single array child argument as a nested array.
+  const [userHead, userText] = rows[0].children[0]
+  const [userBadge, userMeta] = userHead.children[0]
+  assert.equal(userBadge.children[0], 'preview.user')
+  assert.equal(userMeta, null, 'no time and no model: no meta span')
+  assert.equal(userText.children[0], 'hello')
+
+  const [assistantHead, assistantText] = rows[1].children[0]
+  const [assistantBadge, assistantMeta] = assistantHead.children[0]
+  assert.equal(assistantBadge.children[0], 'preview.assistant')
+  assert.match(String(assistantMeta.children[0]), /deepseek-flash/, 'the model rides the meta span')
+  assert.equal(assistantText.children[0], 'hi')
 })
 
 test('a failed mount reports its reason instead of a generic missing service', async () => {

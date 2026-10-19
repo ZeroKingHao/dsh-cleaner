@@ -21,6 +21,7 @@ import {
   normalizeForCompare,
   planDeletion,
   readSessionHeader,
+  readSessionTranscript,
   rootsFor,
   scanSessions,
   writeJsonAtomic,
@@ -45,6 +46,41 @@ function writeSession(roots, workspaceKey, id, header, body = '') {
   const file = path.join(dir, 'session.v4.jsonl.zstd')
   writeFileSync(file, zstdCompressSync(Buffer.from(lines, 'utf8')))
   return dir
+}
+
+/**
+ * Write a whole event log from JSON-serializable lines. `frames: true` stores
+ * every line as its own zstd frame — the shape real v4 logs grow into (one
+ * frame per writing episode), and a harsher boundary than reality because a
+ * cut lands between EVERY pair of lines.
+ */
+function writeLogLines(roots, workspaceKey, id, events, { name = 'session.v4.jsonl.zstd', frames = false } = {}) {
+  const dir = path.join(roots.sessions, workspaceKey, id)
+  mkdirSync(dir, { recursive: true })
+  const file = path.join(dir, name)
+  if (!name.endsWith('.zstd')) {
+    writeFileSync(file, Buffer.from(events.map((event) => JSON.stringify(event)).join('\n') + '\n', 'utf8'))
+    return file
+  }
+  if (frames) {
+    const perLine = events.map((event) => zstdCompressSync(Buffer.from(`${JSON.stringify(event)}\n`, 'utf8')))
+    writeFileSync(file, Buffer.concat(perLine))
+    return file
+  }
+  writeFileSync(file, zstdCompressSync(Buffer.from(events.map((event) => JSON.stringify(event)).join('\n') + '\n', 'utf8')))
+  return file
+}
+
+/** A minimal conversation: session header, one user turn, one assistant turn. */
+function conversationEvents() {
+  return [
+    { type: 'session', version: 4, id: USER_A, createdAt: 1790000000000, cwd: 'F:\\dsh-cleaner' },
+    { type: 'turn/start', seq: 1, data: {} },
+    { type: 'step/start', seq: 2, data: {} },
+    { type: 'user/message', seq: 8, time: 1790000001000, data: { role: 'user', content: [{ type: 'text', text: 'Reply with exactly: OK' }], source: { kind: 'user' } } },
+    { type: 'assistant/message', seq: 9, time: 1790000002000, data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'reasoning', text: 'internal deliberation' }, { type: 'text', text: 'OK' }], source: { kind: 'model', provider: 'deepseek-official', model: 'deepseek-flash' } } } },
+    { type: 'session/title', seq: 10, data: { title: 'Reply with exactly: OK', messageSeqs: [8], source: { kind: 'fallback' } } },
+  ]
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +169,139 @@ test('readSessionHeader returns undefined instead of throwing on garbage', async
   writeFileSync(file, Buffer.from('this is definitely not zstd'))
   assert.equal(await readSessionHeader(file), undefined)
   assert.equal(await readSessionHeader(path.join(dir, 'missing.jsonl.zstd')), undefined)
+})
+
+// ---------------------------------------------------------------------------
+// Transcript reading
+// ---------------------------------------------------------------------------
+
+test('readSessionTranscript projects the conversation, title and created time', async () => {
+  const { roots } = makeHome()
+  const file = writeLogLines(roots, '--ws--', USER_A, conversationEvents())
+  const transcript = await readSessionTranscript(file)
+
+  assert.equal(transcript.title, 'Reply with exactly: OK')
+  assert.equal(transcript.createdAt, 1790000000000)
+  assert.equal(transcript.truncated, false)
+  assert.equal(transcript.totalMessages, 2)
+  assert.deepEqual(transcript.messages, [
+    { role: 'user', text: 'Reply with exactly: OK', time: 1790000001000 },
+    { role: 'assistant', text: 'OK', time: 1790000002000, model: 'deepseek-flash' },
+  ])
+})
+
+test('readSessionTranscript drops turns without text', async () => {
+  const { roots } = makeHome()
+  const file = writeLogLines(roots, '--ws--', USER_A, [
+    { type: 'session', id: USER_A },
+    // Tool-call turn: no text block at all.
+    { type: 'assistant/message', seq: 3, data: { message: { role: 'assistant', content: [{ type: 'tool_use', name: 'bash', input: {} }], source: { kind: 'model' } } } },
+    // Reasoning-only turn: text stays empty after the join.
+    { type: 'assistant/message', seq: 4, data: { message: { content: [{ type: 'reasoning', text: 'hmm' }], source: { kind: 'model' } } } },
+    { type: 'user/message', seq: 5, data: { content: [{ type: 'text', text: 'real message' }] } },
+  ])
+  const transcript = await readSessionTranscript(file)
+  assert.equal(transcript.totalMessages, 1)
+  assert.deepEqual(transcript.messages.map((message) => message.text), ['real message'])
+})
+
+test('readSessionTranscript filters injected context when a human turn exists', async () => {
+  const { roots } = makeHome()
+  // The shape real logs show: DSH's runtime-context snapshot and skill
+  // catalog ride user/message events under source.kind 'plugin' /
+  // 'skill-catalog', flooding the preview around the one human line.
+  const file = writeLogLines(roots, '--ws--', USER_A, [
+    { type: 'session', id: USER_A },
+    { type: 'user/message', seq: 7, data: { role: 'user', content: [{ type: 'text', text: 'injected runtime context' }], source: { kind: 'plugin' } } },
+    { type: 'user/message', seq: 8, data: { role: 'user', content: [{ type: 'text', text: 'Reply with exactly: OK' }], source: { kind: 'user' } } },
+    { type: 'user/message', seq: 9, data: { role: 'user', content: [{ type: 'text', text: 'injected skill catalog' }], source: { kind: 'skill-catalog' } } },
+  ])
+  const transcript = await readSessionTranscript(file)
+  assert.deepEqual(transcript.messages.map((message) => message.text), ['Reply with exactly: OK'])
+  assert.equal(transcript.totalMessages, 1)
+})
+
+test('readSessionTranscript keeps injected events when no human turn is recognisable', async () => {
+  const { roots } = makeHome()
+  // A future kind value would otherwise blank the preview: with no 'user'
+  // line at all, everything survives.
+  const file = writeLogLines(roots, '--ws--', USER_A, [
+    { type: 'session', id: USER_A },
+    { type: 'user/message', seq: 7, data: { role: 'user', content: [{ type: 'text', text: 'unknown provenance' }], source: { kind: 'future-kind' } } },
+  ])
+  const transcript = await readSessionTranscript(file)
+  assert.deepEqual(transcript.messages.map((message) => message.text), ['unknown provenance'])
+})
+
+test('readSessionTranscript decodes every concatenated zstd frame', async () => {
+  const { roots } = makeHome()
+  // One frame PER LINE: a one-shot decompress call would only ever see the
+  // first one, so this pins the streaming requirement.
+  const file = writeLogLines(roots, '--ws--', USER_A, conversationEvents(), { frames: true })
+  const transcript = await readSessionTranscript(file)
+  assert.equal(transcript.title, 'Reply with exactly: OK')
+  assert.equal(transcript.totalMessages, 2)
+  assert.equal(transcript.messages[1].text, 'OK')
+})
+
+test('readSessionTranscript reads an uncompressed jsonl log', async () => {
+  const { roots } = makeHome()
+  const file = writeLogLines(roots, '--ws--', USER_B, conversationEvents(), { name: 'session.v3.jsonl' })
+  const transcript = await readSessionTranscript(file)
+  assert.equal(transcript.totalMessages, 2)
+  assert.equal(transcript.messages[0].role, 'user')
+})
+
+test('readSessionTranscript reads a v4 meta-wrapped header line', async () => {
+  const { roots } = makeHome()
+  const events = conversationEvents()
+  events[0] = { type: 'session', meta: { id: USER_A, createdAt: 1790000005000 } }
+  const transcript = await readSessionTranscript(writeLogLines(roots, '--ws--', USER_A, events))
+  assert.equal(transcript.createdAt, 1790000005000)
+})
+
+test('readSessionTranscript caps the message count and reports the truth', async () => {
+  const { roots } = makeHome()
+  const events = [{ type: 'session', id: USER_A }]
+  for (let index = 0; index < 5; index += 1) {
+    events.push({ type: 'user/message', seq: index, data: { content: [{ type: 'text', text: `m${index}` }] } })
+  }
+  const transcript = await readSessionTranscript(writeLogLines(roots, '--ws--', USER_A, events), { maxMessages: 2 })
+  assert.equal(transcript.messages.length, 2)
+  assert.deepEqual(transcript.messages.map((message) => message.text), ['m0', 'm1'])
+  assert.equal(transcript.totalMessages, 5)
+  assert.equal(transcript.truncated, true)
+})
+
+test('readSessionTranscript clips a single huge message', async () => {
+  const { roots } = makeHome()
+  const events = [
+    { type: 'session', id: USER_A },
+    { type: 'user/message', data: { content: [{ type: 'text', text: 'x'.repeat(50) }] } },
+  ]
+  const transcript = await readSessionTranscript(writeLogLines(roots, '--ws--', USER_A, events), { maxCharsPerMessage: 10 })
+  assert.equal(transcript.messages[0].text, 'xxxxxxxxxx…')
+})
+
+test('readSessionTranscript skips oversized carrier lines without parsing', async () => {
+  const { roots } = makeHome()
+  const events = [
+    { type: 'session', id: USER_A },
+    // A streaming carrier line (full deltas attached) far over the line cap.
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'y'.repeat(1024 * 1024 + 10) }] } } },
+    { type: 'user/message', data: { content: [{ type: 'text', text: 'kept' }] } },
+  ]
+  const transcript = await readSessionTranscript(writeLogLines(roots, '--ws--', USER_A, events))
+  assert.deepEqual(transcript.messages.map((message) => message.text), ['kept'])
+  assert.equal(transcript.totalMessages, 1)
+})
+
+test('readSessionTranscript rejects a missing log', async () => {
+  const { roots } = makeHome()
+  await assert.rejects(
+    readSessionTranscript(path.join(roots.sessions, '--ws--', 'gone', 'session.v4.jsonl.zstd')),
+    /ENOENT/,
+  )
 })
 
 // ---------------------------------------------------------------------------

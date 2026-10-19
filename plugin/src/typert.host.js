@@ -8,13 +8,13 @@
  * contract so the two halves cannot drift.
  */
 
-import { SESSION_CLEANER_DELETE, SESSION_CLEANER_JSON_SCHEMA, SESSION_CLEANER_LIST, SESSION_CLEANER_PREVIEW } from './contract.cjs'
+import { SESSION_CLEANER_DELETE, SESSION_CLEANER_JSON_SCHEMA, SESSION_CLEANER_LIST, SESSION_CLEANER_PREVIEW, SESSION_CLEANER_READ } from './contract.cjs'
 
 export const TYPERT = {
   package: 'dsh-plugin-session-cleaner',
   face: 'host',
   schemas: [SESSION_CLEANER_JSON_SCHEMA],
-  invocations: [SESSION_CLEANER_LIST, SESSION_CLEANER_PREVIEW, SESSION_CLEANER_DELETE],
+  invocations: [SESSION_CLEANER_LIST, SESSION_CLEANER_PREVIEW, SESSION_CLEANER_READ, SESSION_CLEANER_DELETE],
   model: {
     services: [{
       key: 'sessionCleaner',
@@ -25,6 +25,7 @@ export const TYPERT = {
       members: [
         { kind: 'method', name: 'list', signature: 'list(): Promise<{ sessions: SessionCleanupRecord[]; skipped: unknown[]; searchIndexes: string[]; dshHome: string }>' },
         { kind: 'method', name: 'preview', signature: 'preview(sessionIds: string[]): Promise<SessionCleanupPlan>' },
+        { kind: 'method', name: 'read', signature: 'read(sessionId: string, options?: { maxMessages?: number; maxCharsPerMessage?: number }): Promise<SessionTranscriptResult>' },
         { kind: 'method', name: 'delete', signature: 'delete(sessionIds: string[], options?: { guard?: string }): Promise<SessionCleanupResult>' },
       ],
       types: [],

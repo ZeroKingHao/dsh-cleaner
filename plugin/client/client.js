@@ -3,6 +3,9 @@
  *
  * Adds a "delete session" row to the sidebar Session menu — the one place a
  * user already looks for per-session actions — and confirms before deleting.
+ * It also contributes a top-level Session-cleanup page (sidebar entry next to
+ * Plugins and Automation Tasks) for listing and batch-deleting every session
+ * on disk.
  *
  * The Host half owns deletion; this file only presents it. DSH's client module
  * system loads one self-contained bundle and hands it a `require`, so React and
@@ -11,7 +14,15 @@
  */
 
 const { TYPERT_REMOTE } = require('../src/contract.cjs')
-const createSettingsTab = require('./settings-tab.js')
+const createPanelPage = require('./panel-page.js')
+
+/**
+ * The panel id. It addresses both the `main` keyed-slot entry (the page) and
+ * the `sidebar.panellist` entry (the row that selects it): the layout's
+ * `selectPanel(id)` resolves the same key, so the two must never diverge.
+ * The shipped pages use "plugins" (order 0) and "schedules" (order 10).
+ */
+const PANEL_ID = 'session-cleaner'
 
 const MESSAGES = Object.freeze({
   en: Object.freeze({
@@ -29,8 +40,9 @@ const MESSAGES = Object.freeze({
     'dialog.failed': 'Deletion failed: {reason}',
     'service.missing': 'The session-cleaner service did not become reachable. Retry the click; if it persists, reload the page.',
     'service.mountFailed': 'Remote mount failed: {reason}',
+    'panel.nav': 'Session cleanup',
     'panel.title': 'Session cleanup',
-    'panel.hint': 'Every session found on disk. Selecting a session also selects its descendant subagent sessions — they are deleted together; a session running in this app cannot be removed and will be refused.',
+    'panel.hint': 'Every session found on disk. Selecting a session also selects its descendant subagent sessions — they are deleted together; a session running in this app cannot be removed and will be refused. Double-click a row (or use its Preview button) to read the conversation before deleting.',
     'panel.loading': 'Scanning sessions…',
     'panel.retry': 'Retry',
     'panel.search': 'Filter by id, workspace or path',
@@ -42,8 +54,16 @@ const MESSAGES = Object.freeze({
     'panel.failed': 'Deletion failed: {reason}',
     'panel.empty': 'No session matches the filter.',
     'panel.child': 'subagent',
+    'panel.preview': 'Preview',
     'panel.root': 'Data root: {path}',
     'panel.serviceMissing': 'The session-cleaner service is unavailable. Check the network panel and reload the page.',
+    'preview.title': 'Conversation preview',
+    'preview.loading': 'Reading the conversation…',
+    'preview.empty': 'No text messages in this session.',
+    'preview.truncated': 'Showing the first {shown} of {total} messages.',
+    'preview.failed': 'Failed to read the conversation: {reason}',
+    'preview.user': 'User',
+    'preview.assistant': 'Assistant',
   }),
   zh: Object.freeze({
     'menu.delete': '删除会话',
@@ -60,8 +80,9 @@ const MESSAGES = Object.freeze({
     'dialog.failed': '删除失败：{reason}',
     'service.missing': '会话清理服务未能在 5 秒内就绪。请再点一次「删除会话」；若反复出现，请重新加载页面。',
     'service.mountFailed': 'Remote 契约挂载失败：{reason}',
+    'panel.nav': '会话清理',
     'panel.title': '会话清理',
-    'panel.hint': '磁盘上的全部会话。勾选主会话会自动带上其派生的子代理会话（它们会被一并删除）；本应用中正在运行的会话无法删除，会被拒绝。',
+    'panel.hint': '磁盘上的全部会话。勾选主会话会自动带上其派生的子代理会话（它们会被一并删除）；本应用中正在运行的会话无法删除，会被拒绝。双击会话行（或点「预览」）可先查看对话内容再决定删除。',
     'panel.loading': '正在扫描会话…',
     'panel.retry': '重试',
     'panel.search': '按 id、工作区或路径筛选',
@@ -73,8 +94,16 @@ const MESSAGES = Object.freeze({
     'panel.failed': '删除失败：{reason}',
     'panel.empty': '没有符合条件的会话。',
     'panel.child': '子代理',
+    'panel.preview': '预览',
     'panel.root': '数据根目录：{path}',
     'panel.serviceMissing': '会话清理服务不可用。请检查连接后重新加载页面。',
+    'preview.title': '对话预览',
+    'preview.loading': '正在读取会话内容…',
+    'preview.empty': '此会话没有可显示的文本消息。',
+    'preview.truncated': '仅显示前 {shown} 条消息（共 {total} 条）。',
+    'preview.failed': '读取会话失败：{reason}',
+    'preview.user': '用户',
+    'preview.assistant': '助手',
   }),
 })
 
@@ -462,19 +491,43 @@ module.exports = function createPlugin(require) {
           id: 'session-cleaner.confirm',
           order: 90,
         }, ConfirmDialog))
-      } catch { /* no overlay host in this composition: deletion stays available through the settings tab */ }
+      } catch { /* no overlay host in this composition: deletion stays available through the panel page */ }
+
+      /**
+       * The sidebar glyph for the panel entry. The sidebar shell renders the
+       * row itself — button, tooltip, label, selected state — and hands the
+       * entry `{ size, active }`. The same trash glyph the menu row uses
+       * keeps the two entries recognizable as one feature.
+       */
+      function PanelIcon({ size }) {
+        if (IconTrashOutlineRegular === undefined) return null
+        return React.createElement(IconTrashOutlineRegular, { size })
+      }
 
       try {
-        // A `label` thunk is re-read on every projection, so the tab text
-        // follows a live locale change without re-registering.
-        const panel = createSettingsTab(React, t, acquire, readFailure)
-        ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
-          name: 'settings.plugins.tab',
-          id: 'session-cleaner',
-          order: 200,
-          label: () => t('panel.title'),
-        }, panel))
-      } catch { /* the settings section may not be mounted in this build */ }
+        // The page itself: a `main` keyed-slot entry under the panel id, next
+        // to the shipped Plugins and Automation Tasks pages. `selectPanel(id)`
+        // dispatches on this key, so a missing entry would make the sidebar
+        // row throw on click — the two registrations below are one unit.
+        const page = createPanelPage(React, t, acquire, readFailure, { Modal, Button })
+        ctx.slots.inject('main', () => ctx.slots.register({
+          name: 'main',
+          key: PANEL_ID,
+        }, page))
+      } catch { /* the layout panel seat is optional in this composition */ }
+
+      try {
+        // The sidebar entry, at the same level as Plugins (order 0) and
+        // Automation Tasks (order 10). A `label` thunk is re-read on every
+        // projection, so the row text follows a live locale change without
+        // re-registering.
+        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+          name: 'sidebar.panellist',
+          id: PANEL_ID,
+          order: 20,
+          label: () => t('panel.nav'),
+        }, PanelIcon))
+      } catch { /* without the sidebar list the page stays reachable through the menu rows */ }
     },
   }
 }
