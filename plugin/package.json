@@ -18,6 +18,7 @@
   },
   "files": [
     "lib",
+    "src",
     "locale",
     "cordis.patch.yml",
     "README.md"
