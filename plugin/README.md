@@ -27,6 +27,8 @@ DSH 本身没有任何删除会话的途径：`sessionPersistence` 只有 `creat
 
 ![侧边栏「会话清理」面板中的批量清理页面](screenshots/settings-panel.png)
 
+![双击会话行或点「预览」查看对话内容](screenshots/preview-dialog.png)
+
 ## 三个入口
 
 1. **侧边栏 · 会话「…」菜单 → 「删除会话」**（排在官方「归档」之后，order 500）。点击后弹确认框，显示会话标题、将要释放的空间、以及是否包含派生子代理会话。

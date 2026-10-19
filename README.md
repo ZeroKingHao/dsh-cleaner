@@ -10,6 +10,8 @@ DSH 本身没有任何删除会话的途径：会话只能归档，官方文档�
 
 ![侧边栏「会话清理」面板中的批量清理页面](plugin/screenshots/settings-panel.png)
 
+![双击会话行或点「预览」查看对话内容](plugin/screenshots/preview-dialog.png)
+
 *以上为示意图（演示数据）。*
 
 ## 功能
