@@ -160,6 +160,7 @@ function createService(ctx) {
         parent: record.parent,
         cwd: record.cwd,
         title: record.title,
+        createdAt: record.createdAt,
       }))
       sessions.sort((left, right) => right.bytes - left.bytes)
       return { sessions, skipped, searchIndexes, dshHome: roots.dshHome }

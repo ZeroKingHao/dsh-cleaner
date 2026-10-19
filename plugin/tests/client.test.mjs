@@ -101,6 +101,18 @@ const settle = async (rounds = 4) => {
   }
 }
 
+/**
+ * Evaluate panel-page.js for its exported helpers. The source file is
+ * CommonJS living under a "type": "module" package, so it runs in a vm context
+ * instead of being imported.
+ */
+function loadPanelPageModule() {
+  const module = { exports: {} }
+  const source = readFileSync(path.resolve(here, '..', 'client', 'panel-page.js'), 'utf8')
+  vm.runInNewContext(source, { module, exports: module.exports, document: undefined }, { filename: 'panel-page.js' })
+  return module.exports
+}
+
 test('the bundle is a factory that returns a Cordis plugin', () => {
   const source = readFileSync(bundlePath, 'utf8')
   // The client module system may not synchronously require a sibling chunk.
@@ -500,13 +512,26 @@ test('the cleanup page opens a conversation preview from a row', async () => {
   })
 
   // The first render mounts and starts loading; after the settle the second
-  // render shows the row list.
+  // render shows the group headers (the list itself starts collapsed).
   render(component)
   await settle()
   const ready = render(component)
-  const labels = collect(ready).filter((node) => node.type === 'label')
+  // A filter that matches auto-expands the group, revealing its rows.
+  const search = collect(ready).find((node) => node.type === 'input' && node.props.type === 'search')
+  search.props.onChange({ target: { value: USER } })
+  const filtered = render(component)
+  const labels = collect(filtered).filter((node) => node.type === 'label')
   assert.equal(labels.length, 1)
   assert.equal(typeof labels[0].props.onDoubleClick, 'function', 'a row double-click opens the preview')
+
+  // Rapidly clicking the checkbox is check/uncheck only: the trailing
+  // dblclick must stop on the checkbox, never reach the label's preview
+  // handler above.
+  const rowCheck = collect(labels[0]).find((node) => node.type === 'input' && node.props.type === 'checkbox')
+  let propagationStopped = false
+  assert.equal(typeof rowCheck.props.onDoubleClick, 'function', 'the checkbox owns its dblclick')
+  rowCheck.props.onDoubleClick({ stopPropagation() { propagationStopped = true } })
+  assert.equal(propagationStopped, true, 'the checkbox swallows its own double-click')
 
   const previewButton = collect(labels[0]).find(
     (node) => node.type === 'button' && node.children.flat().includes('Preview'))
@@ -519,17 +544,22 @@ test('the cleanup page opens a conversation preview from a row', async () => {
   assert.equal(readCalls[0][0], USER)
   assert.deepEqual({ ...readCalls[0][1] }, {}, 'the button reaches the Host read with empty options')
 
-  // The settled third render shows the dialog (no primitives lane: the
-  // hand-rolled overlay card).
+  // The settled third render shows the dialog: a wide, resizable card.
   const withDialog = render(component)
   const dialog = collect(withDialog).find((node) => node.props?.role === 'dialog')
   assert.notEqual(dialog, undefined)
   assert.equal(dialog.props['aria-label'], 'Conversation preview')
+  assert.equal(dialog.props.style.width, 'min(92vw, 920px)', 'wide by default')
+  const grip = collect(withDialog).find((node) => node.props?.['aria-label'] === 'Resize (double-click to reset)')
+  assert.notEqual(grip, undefined, 'the corner resize grip is rendered')
+  // No panel DOM in the stub: the drag starter must bail out, not throw.
+  grip.props.onPointerDown({})
   const paragraphs = collect(withDialog)
     .filter((node) => node.type === 'p')
     .map((node) => node.children.flat().join(''))
   assert.ok(paragraphs.some((text) => text.includes('A titled conversation')), 'the title from the log is shown')
-  assert.ok(paragraphs.some((text) => text.includes('--ws--')), 'the workspace key is shown')
+  assert.ok(paragraphs.some((text) => text.includes(USER)), 'the session id sits under the preview title')
+  assert.ok(paragraphs.some((text) => text.includes('F:\\x')), 'the workspace path is shown (not its encoded key)')
   const messageTexts = collect(withDialog)
     .filter((node) => node.type === 'div' && node.props?.key === 'text')
     .map((node) => node.children.flat().join(''))
@@ -584,6 +614,252 @@ test('toggling a session carries its descendant subtree along', () => {
   // a checked root would drag the subtree back into the deletion closure.
   const fromParent = toggleWithDescendants(sessions, new Set(['root', 'childA', 'grandchild', 'childB']), 'childA')
   assert.deepEqual([...fromParent], ['childB'])
+})
+
+test('buildWorkspaceGroups groups by workspace, names from cwd and nests subagents', () => {
+  const { buildWorkspaceGroups, collectSessions } = loadPanelPageModule()
+
+  const PARENT = 'session-parent'
+  const CHILD_A = 'child-a'
+  const CHILD_B = 'child-b'
+  const ORPHAN = 'orphan'
+  const sessions = [
+    { id: PARENT, workspaceKey: '--ws-a--', cwd: 'F:\\alpha', bytes: 100, createdAt: 3000, title: 'P' },
+    { id: CHILD_A, workspaceKey: '--ws-a--', cwd: 'F:\\alpha', bytes: 50, createdAt: 4000, parent: PARENT },
+    { id: CHILD_B, workspaceKey: '--ws-a--', cwd: 'F:\\alpha', bytes: 10, createdAt: 3500, parent: PARENT },
+    // The parent is gone from the list: the subagent must root its own tree
+    // instead of vanishing.
+    { id: ORPHAN, workspaceKey: '--ws-a--', cwd: 'F:\\alpha', bytes: 5, parent: 'gone' },
+    { id: 'other', workspaceKey: '--ws-b--', bytes: 500, createdAt: 2000 },
+  ]
+
+  const groups = buildWorkspaceGroups(sessions)
+  assert.equal(groups.length, 2)
+  // Groups sort by total bytes: ws-b (500) outranks ws-a (165).
+  assert.equal(groups[0].key, '--ws-b--')
+  assert.equal(groups[0].name, '--ws-b--', 'no cwd anywhere: the raw key is the name')
+  assert.equal(groups[0].path, undefined)
+  assert.equal(groups[1].key, '--ws-a--')
+  assert.equal(groups[1].name, 'alpha')
+  assert.equal(groups[1].path, 'F:\\alpha')
+  assert.equal(groups[1].count, 4)
+  assert.equal(groups[1].childCount, 3)
+
+  const [parent, orphan] = groups[1].roots
+  assert.equal(parent.session.id, PARENT)
+  assert.equal(parent.orphan, false)
+  // Subagents sort oldest first (spawn order); roots newest first. The arrays
+  // come from the vm realm, so they are spread into host arrays first —
+  // cross-realm prototypes never compare strictly equal.
+  assert.deepEqual([...parent.children.map((node) => node.session.id)], [CHILD_B, CHILD_A])
+  assert.equal(orphan.session.id, ORPHAN)
+  assert.equal(orphan.orphan, true)
+
+  // Flattening walks parents before children.
+  assert.deepEqual([...collectSessions(groups[1].roots).map((session) => session.id)], [PARENT, CHILD_B, CHILD_A, ORPHAN])
+})
+
+test('setSelection drives bulk affordances through the row cascade', () => {
+  const { setSelection } = loadPanelPageModule()
+  const sessions = [
+    { id: 'root' },
+    { id: 'child', parent: 'root' },
+    { id: 'other' },
+  ]
+
+  // Select-all carries the hidden descendant along.
+  const selected = setSelection(sessions, new Set(), ['root', 'other'], true)
+  assert.deepEqual([...selected].sort(), ['child', 'other', 'root'])
+
+  // Deselecting the group removes exactly its closure.
+  const deselected = setSelection(sessions, selected, ['root', 'child'], false)
+  assert.deepEqual([...deselected], ['other'])
+})
+
+test('collectDescendants walks the parent links breadth-first', () => {
+  const { collectDescendants } = loadPanelPageModule()
+  const sessions = [
+    { id: 'root' },
+    { id: 'a', parent: 'root' },
+    { id: 'b', parent: 'root' },
+    { id: 'grand', parent: 'a' },
+    { id: 'other' },
+  ]
+  // The vm realm's arrays are spread into host arrays before comparing.
+  assert.deepEqual([...collectDescendants(sessions, 'root').map((session) => session.id)], ['a', 'b', 'grand'])
+  assert.deepEqual([...collectDescendants(sessions, 'other')], [])
+})
+
+test('the cleanup page groups workspaces, nests subagents and reveals ids in the preview', async () => {
+  const { React, render } = statefulReactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return { createPortal: (node) => node }
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const PARENT = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const CHILD = 'bbbbbbbb-1111-2222-3333-444444444444'
+  const OTHER = 'session-cccccccc-1111-2222-3333-444444444444'
+  const readCalls = []
+  const service = {
+    list: async () => ({
+      sessions: [
+        { id: PARENT, workspaceKey: '--ws-a--', bytes: 10, humanBytes: '10 B', parent: undefined, cwd: 'F:\\alpha', title: 'Parent title', createdAt: 2000 },
+        { id: CHILD, workspaceKey: '--ws-a--', bytes: 4, humanBytes: '4 B', parent: PARENT, cwd: 'F:\\alpha', title: 'Child title', createdAt: 3000 },
+        { id: OTHER, workspaceKey: '--ws-b--', bytes: 100, humanBytes: '100 B', parent: undefined, cwd: 'G:\\beta', title: 'Other title', createdAt: 1000 },
+      ],
+    }),
+    read: async (sessionId) => {
+      readCalls.push(sessionId)
+      return {
+        ok: true, id: sessionId, workspaceKey: '--ws-a--', cwd: 'F:\\alpha',
+        bytes: 10, humanBytes: '10 B', title: 'Parent title', createdAt: 2000,
+        messages: [], totalMessages: 0, truncated: false,
+      }
+    },
+  }
+  let component
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback({ 'remote.sessionCleaner': service }) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) {
+        if (options.name === 'main') component = value
+      },
+    },
+  })
+
+  render(component)
+  await settle()
+  const ready = render(component)
+
+  // Collapsed by default: every group header shows, no session rows yet.
+  const headers = collect(ready).filter((node) => node.props?.role === 'group')
+  assert.equal(headers.length, 2)
+  assert.equal(collect(ready).filter((node) => node.type === 'label').length, 0, 'groups start collapsed')
+  // The header is titled with the cwd's last segment plus the full path.
+  const alphaHeader = headers.find((node) => node.props['aria-label'] === 'alpha')
+  assert.notEqual(alphaHeader, undefined)
+  const headerSpans = collect(alphaHeader).filter((node) => node.type === 'span')
+  assert.ok(headerSpans.some((span) => span.children[0] === 'alpha'))
+  assert.ok(headerSpans.some((span) => span.children[0] === 'F:\\alpha'))
+
+  // Expanding the group reveals the parent row, titled rather than id-ed.
+  alphaHeader.props.onClick()
+  const expanded = render(component)
+  let labels = collect(expanded).filter((node) => node.type === 'label')
+  assert.equal(labels.length, 1, 'the parent row shows; its subagent stays nested')
+  assert.equal(labels[0].props.key, PARENT)
+  const rowSpans = collect(labels[0]).filter((node) => node.type === 'span')
+  assert.ok(rowSpans.some((span) => span.children[0] === 'Parent title'), 'the row is titled')
+  assert.ok(rowSpans.every((span) => span.children[0] !== PARENT), 'the id is not the row label')
+
+  // The group checkbox selects the whole group through the cascade — the
+  // still-hidden subagent included, as the delete-button totals attest.
+  collect(alphaHeader).find((node) => node.type === 'input').props.onChange()
+  const totals = collect(render(component))
+    .filter((node) => node.type === 'button')
+    .map((node) => node.children.flat().join(''))
+  assert.ok(totals.some((text) => text.includes('Delete 2 selected (14 B)')))
+
+  // Expanding the parent row reveals the subagent, badged and selected.
+  const parentExpander = collect(labels[0]).find((node) => node.type === 'button' && node.props['aria-label'] === 'Expand')
+  assert.notEqual(parentExpander, undefined, 'the parent row carries a caret button')
+  assert.deepEqual(parentExpander.children, ['▶'], 'the caret is the collapsed triangle glyph')
+  parentExpander.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  const withChild = render(component)
+  labels = collect(withChild).filter((node) => node.type === 'label')
+  assert.equal(labels.length, 2)
+  const childLabel = labels.find((node) => node.props.key === CHILD)
+  assert.notEqual(childLabel, undefined)
+  assert.ok(collect(childLabel).some((node) => node.type === 'span' && node.children[0] === 'subagent'))
+  assert.equal(collect(childLabel).find((node) => node.type === 'input').props.checked, true)
+
+  // The preview dialog shows the session id under the title, and the
+  // subagent ids that would be deleted along with it, badged as subagents.
+  const parentRow = labels.find((node) => node.props.key === PARENT)
+  const previewButton = collect(parentRow).find((node) => node.type === 'button' && node.children.flat().includes('Preview'))
+  await previewButton.props.onClick({ preventDefault() {}, stopPropagation() {} })
+  await settle()
+  const withDialog = render(component)
+  assert.equal(readCalls.length, 1)
+  // The id line sits under the preview title: a label span plus the id text.
+  const idLine = collect(withDialog).find((node) => node.props?.key === 'sessionid')
+  assert.notEqual(idLine, undefined)
+  assert.equal(idLine.children[0][1], PARENT)
+  assert.equal(collect(idLine).find((node) => node.type === 'span').children[0], 'Session ID: ')
+  assert.ok(collect(withDialog)
+    .filter((node) => node.type === 'p')
+    .some((node) => node.children.flat().join('').includes('Subagent sessions (1)')), 'the descendant block is announced')
+  // Scope to a div: the list's subagent row is a label carrying the same key.
+  const childRow = collect(withDialog).find((node) => node.type === 'div' && node.props?.key === CHILD)
+  assert.notEqual(childRow, undefined)
+  assert.ok(collect(childRow).some((node) => node.type === 'span' && node.children[0] === 'subagent'))
+  assert.ok(collect(childRow).some((node) => node.type === 'span' && node.children[0] === CHILD))
+})
+
+test('a text filter auto-expands matching groups and keeps the tree shape', async () => {
+  const { React, render } = statefulReactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return { createPortal: (node) => node }
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const PARENT = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const CHILD = 'bbbbbbbb-1111-2222-3333-444444444444'
+  const service = {
+    list: async () => ({
+      sessions: [
+        { id: PARENT, workspaceKey: '--ws-a--', bytes: 10, humanBytes: '10 B', parent: undefined, cwd: 'F:\\alpha', title: 'Parent title', createdAt: 2000 },
+        { id: CHILD, workspaceKey: '--ws-a--', bytes: 4, humanBytes: '4 B', parent: PARENT, cwd: 'F:\\alpha', title: 'Child title', createdAt: 3000 },
+        { id: 'session-cccccccc-1111-2222-3333-444444444444', workspaceKey: '--ws-b--', bytes: 100, humanBytes: '100 B', parent: undefined, cwd: 'G:\\beta', title: 'Other title', createdAt: 1000 },
+      ],
+    }),
+    read: async () => ({}),
+  }
+  let component
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback({ 'remote.sessionCleaner': service }) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) {
+        if (options.name === 'main') component = value
+      },
+    },
+  })
+
+  render(component)
+  await settle()
+  const ready = render(component)
+  const search = collect(ready).find((node) => node.type === 'input' && node.props.type === 'search')
+
+  // Matching only the subagent keeps its parent row for the tree shape, and
+  // the matched group opens without a click.
+  search.props.onChange({ target: { value: 'child title' } })
+  const filtered = render(component)
+  const labels = collect(filtered).filter((node) => node.type === 'label')
+  assert.deepEqual(labels.map((label) => label.props.key).sort(), [CHILD, PARENT].sort())
+  assert.equal(collect(filtered).some((node) => node.props?.['aria-label'] === 'beta'), false, 'the unmatched group is gone')
+
+  // Matching the workspace path keeps the whole group.
+  search.props.onChange({ target: { value: 'G:\\beta' } })
+  const byPath = render(component)
+  assert.equal(collect(byPath).filter((node) => node.type === 'label').length, 1)
+
+  // No match anywhere: the empty hint replaces the list.
+  search.props.onChange({ target: { value: 'zzz' } })
+  const none = render(component)
+  assert.equal(collect(none).filter((node) => node.type === 'label').length, 0)
+  const paragraphs = collect(none).filter((node) => node.type === 'p').map((node) => node.children.flat().join(''))
+  assert.ok(paragraphs.some((text) => text.includes('No session matches')))
 })
 
 test('renderMessages lays out both sides of a transcript', () => {

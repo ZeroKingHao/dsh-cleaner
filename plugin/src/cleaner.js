@@ -118,6 +118,34 @@ export async function readSessionHeader(logFile) {
   }
 }
 
+/**
+ * Read the projection cache that rides beside a session log.
+ *
+ * The cache is the reliable TITLE source — the log header's title is usually
+ * empty, and the real one only ever arrives as a later `session/title` event —
+ * and it covers subagent sessions too. It also carries `identity.cwd` and
+ * `identity.createdAt`, which the header may lack. Returns `undefined` when the
+ * file is missing or malformed: like the header, this is display metadata and
+ * must never fail a scan.
+ */
+export async function readProjectionCache(cacheFile) {
+  try {
+    const parsed = JSON.parse(await readFile(cacheFile, 'utf8'))
+    const record = parsed?.record
+    if (record === null || typeof record !== 'object') return undefined
+    const title = record.rows?.title?.val
+    const createdAt = record.identity?.createdAt
+    const cwd = record.identity?.cwd
+    return {
+      title: typeof title === 'string' && title.length > 0 ? title : undefined,
+      createdAt: typeof createdAt === 'number' ? createdAt : undefined,
+      cwd: typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined,
+    }
+  } catch {
+    return undefined
+  }
+}
+
 /** A line longer than this is a streaming carrier, not preview material. */
 const MAX_TRANSCRIPT_LINE_CHARS = 1024 * 1024
 
@@ -313,6 +341,7 @@ export async function scanSessions(roots) {
         bytes = 0
       }
       const header = await readSessionHeader(logFile)
+      const cache = await readProjectionCache(path.join(roots.projectionCache, `${dir.name}.json`))
       records.set(dir.name, {
         id: dir.name,
         workspaceKey,
@@ -321,8 +350,11 @@ export async function scanSessions(roots) {
         logName,
         bytes,
         parent: header?.parent,
-        cwd: header?.cwd,
-        title: header?.title,
+        cwd: header?.cwd ?? cache?.cwd,
+        // The cache title beats the header's (the header's is usually empty);
+        // the header cwd is authoritative, the cache's only fills a gap.
+        title: cache?.title ?? header?.title,
+        createdAt: cache?.createdAt,
       })
     }
   }

@@ -330,6 +330,38 @@ test('scanSessions tolerates a missing sessions root', async () => {
   assert.deepEqual(skipped, [])
 })
 
+test('scanSessions lifts titles and creation times from the projection cache', async () => {
+  const { roots } = makeHome()
+  // The header's title is empty in real logs; the real one lives in the cache.
+  writeSession(roots, '--ws--', USER_A, { id: USER_A, title: '' })
+  writeSession(roots, '--ws--', CHILD, { id: CHILD, parentSession: USER_A })
+  writeFileSync(path.join(roots.projectionCache, `${USER_A}.json`), JSON.stringify({
+    record: {
+      identity: { cwd: 'F:\\proj', createdAt: 1790000000000 },
+      rows: { title: { ver: 1, seq: 20, val: 'Cached title' } },
+    },
+  }))
+  // A corrupted cache degrades to the header, never failing the scan.
+  writeFileSync(path.join(roots.projectionCache, `${CHILD}.json`), '{not json')
+
+  const { records } = await scanSessions(roots)
+  assert.equal(records.get(USER_A).title, 'Cached title')
+  assert.equal(records.get(USER_A).createdAt, 1790000000000)
+  // The header cwd is authoritative; the cache's fills a missing one.
+  assert.equal(records.get(USER_A).cwd, 'F:\\proj')
+  assert.equal(records.get(CHILD).title, undefined)
+  assert.equal(records.get(CHILD).createdAt, undefined)
+})
+
+test('the header title and cwd still win when the cache is silent', async () => {
+  const { roots } = makeHome()
+  writeSession(roots, '--ws--', USER_B, { id: USER_B, title: 'Header title', cwd: 'E:\\y' })
+  const { records } = await scanSessions(roots)
+  assert.equal(records.get(USER_B).title, 'Header title')
+  assert.equal(records.get(USER_B).cwd, 'E:\\y')
+  assert.equal(records.get(USER_B).createdAt, undefined)
+})
+
 // ---------------------------------------------------------------------------
 // Cascade
 // ---------------------------------------------------------------------------
