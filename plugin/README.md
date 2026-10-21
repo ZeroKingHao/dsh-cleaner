@@ -46,15 +46,19 @@ DSH 本身没有任何删除会话的途径：`sessionPersistence` 只有 `creat
 
 ## 安装
 
-DSH 的 profile 使用 pnpm 的 `file:` 依赖 + `dsh.profile.bundles` 声明：
+**推荐：DSH「添加插件」对话框**。在 DSH 的「插件」页打开「添加插件」，输入包名 `dsh-plugin-session-cleaner`（npm 官方源与中国大陆镜像源均已上架），确认添加后**完全退出并重启 DSH**。
+
+也可以手动声明 profile 依赖（效果等价）：
 
 ```jsonc
 // ~/.dsh/profiles/<profile>/package.json
 {
-  "dependencies": { "dsh-plugin-session-cleaner": "file:<本仓库的克隆路径>\\plugin" },
+  "dependencies": { "dsh-plugin-session-cleaner": "^0.2.0" },
   "dsh": { "profile": { "bundles": [ /* ... */, "dsh-plugin-session-cleaner" ] } }
 }
 ```
+
+随后在 profile 目录执行 `pnpm install`。本地开发则把依赖指回工作树 `"file:<本仓库的克隆路径>\plugin"`，改完代码重新 `pnpm install`。
 
 **安装后需要重启 DSH**：插件行在 Loader 配置中会先显示为 `absent`，只有重启才会激活（Host 侧与客户端 bundle 都是如此）。
 

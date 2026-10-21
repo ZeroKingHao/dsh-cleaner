@@ -1,7 +1,6 @@
 {
   "name": "dsh-plugin-session-cleaner",
   "version": "0.2.0",
-  "private": true,
   "description": "Completely delete DSH sessions: session logs, projection cache, workspace-registry references and derived search indexes.",
   "type": "module",
   "license": "MIT",
