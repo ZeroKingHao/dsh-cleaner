@@ -306,6 +306,9 @@ function renderMessages(React, t, messages) {
 
 module.exports = function createPanelPage(React, t, acquire, readFailure, primitives) {
   const { useState, useEffect, useMemo, useRef } = React
+  // Optional: called after a successful batch deletion so the client can
+  // re-pull its session list and drop the deleted rows from the sidebar.
+  const afterDelete = primitives?.afterDelete
 
   return function SessionCleanerPage() {
     const [state, setState] = useState({ phase: 'loading' })
@@ -409,6 +412,9 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
         if (result?.ok === false) {
           setNotice({ kind: 'error', text: t('panel.failed', { reason: result.error ?? 'unknown' }) })
         } else {
+          // The files are gone: refresh the client session list so the
+          // sidebar drops these rows without a restart.
+          try { afterDelete?.() } catch { /* best effort */ }
           setNotice({
             kind: 'done',
             text: t('panel.deleted', {

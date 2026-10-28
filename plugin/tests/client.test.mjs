@@ -283,8 +283,9 @@ test('acquire mounts once and reads the namespace under its composed property ke
   assert.equal(mounts[0].descriptors.length, 4)
   // The dependency array was created inside the vm sandbox, so expand it into
   // a host-realm array before deep comparison (cross-realm Array prototypes
-  // never compare equal).
-  assert.deepEqual(injected.map((keys) => [...keys]), [['remote.sessionCleaner']])
+  // never compare equal). The session-list injection is the refresh channel
+  // opened at apply time; the namespace injection happens on first acquire.
+  assert.deepEqual(injected.map((keys) => [...keys]), [['sessions'], ['remote.sessionCleaner']])
   assert.equal(
     scopeReads.filter((key) => key === 'remote.sessionCleaner').length > 0,
     true,
@@ -399,6 +400,58 @@ test('the confirm dialog renders through the platform Modal and Button pair', as
   assert.deepEqual(actions.map((action) => action.children.flat()), [['Cancel'], ['Delete permanently']])
   // While the preview is still in flight the destructive action stays disabled.
   assert.equal(actions[1].props.disabled, true)
+})
+
+test('a successful delete re-pulls the client session list once', async () => {
+  const { React, reactDom } = reactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return reactDom
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const refreshes = []
+  const service = {
+    preview: async () => ({ targetCount: 1, humanBytes: '12.0 KiB' }),
+    delete: async () => ({ ok: true }),
+  }
+  const scope = {
+    'remote.sessionCleaner': service,
+    // The client's session-list snapshot service (api-session-controller):
+    // refresh() re-runs session/list on the Host and drops rows whose
+    // session files no longer exist.
+    sessions: { refresh: async () => { refreshes.push(1) } },
+  }
+  const registrations = []
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback(scope) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) { registrations.push({ options, value }); return () => {} },
+    },
+  })
+  const menu = registrations.find((entry) => entry.options.name === 'sidebar.workspaces.session.menu.item')
+  const overlay = registrations.find((entry) => entry.options.name === 'shell.overlay')
+
+  const sessionId = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const row = menu.value({ sessionId, displayTitle: 'A session', useMenuOpenState: () => [true, () => {}] })
+  await row.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+
+  // Fallback card (no primitives lane): find the destructive confirm among
+  // the rendered buttons by its label.
+  const dialog = overlay.value({})
+  const confirm = collect(dialog).find((node) =>
+    node.type === 'button' && node.children.flat().includes('Delete permanently'))
+  await confirm.props.onClick()
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(refreshes.length, 1, 'exactly one session-list refresh after a deletion')
 })
 
 test('the sidebar entry renders the trash glyph at the size the row hands it', async () => {

@@ -551,14 +551,24 @@ export function assertDeletable(target, allowedRoots) {
 /**
  * Execute a plan. Order is deliberate and must not be reordered:
  *   1. stop every running session,
- *   2. detach registry references,
- *   3. delete session directories and projection caches,
+ *   2. delete session directories and projection caches,
+ *   3. detach registry references,
  *   4. purge derived search indexes that can no longer be reconciled.
  *
- * `stop` is injected so this module stays testable and free of runtime coupling.
+ * Step 3 has two authorities. `options.detachRegistry(ids)` — injected when a
+ * live DSH registry service is reachable — detaches through the in-memory
+ * registry, which also updates the running app's workspace projection, and it
+ * runs AFTER the file deletions: the sidebar renders rows from the client's
+ * session-list snapshot, so detaching first would flash a still-listed row
+ * into Ungrouped before the client re-pulls the list. Without the service
+ * (offline runs, tests) the registry FILE is rewritten in place BEFORE the
+ * deletions, so no row can outlive its log across a restart.
+ *
+ * `stop` is injected the same way, so this module stays testable and free of
+ * runtime coupling.
  */
 export async function executeDeletion(roots, plan, options = {}) {
-  const { stop, now = () => Date.now() } = options
+  const { stop, detachRegistry, now = () => Date.now() } = options
   const allowedRoots = [roots.sessions, roots.storages]
   const result = {
     startedAt: now(),
@@ -566,6 +576,7 @@ export async function executeDeletion(roots, plan, options = {}) {
     registryChanges: [],
     deleted: [],
     failed: [],
+    warnings: [],
     searchIndexesRemoved: [],
     searchIndexesKept: [],
   }
@@ -585,18 +596,21 @@ export async function executeDeletion(roots, plan, options = {}) {
 
   const blocked = new Set(result.failed.map((entry) => entry.id))
 
-  // 2. Detach registry references first, so no row survives its own log.
-  let registry = await readWorkspaceRegistry(roots)
-  if (registry !== undefined) {
-    const removable = plan.targets.filter((target) => !blocked.has(target.id)).map((target) => target.id)
-    const projected = detachFromRegistry(registry, removable)
-    if (projected.changes.length > 0) {
-      try {
-        await writeJsonAtomic(roots.workspaceRegistry, projected.registry)
-        registry = projected.registry
-        result.registryChanges = projected.changes
-      } catch (error) {
-        result.failed.push({ id: '*', stage: 'registry', reason: String(error?.message ?? error) })
+  // 2. Offline registry detach: rewrite the file before deleting anything, so
+  //    no row survives its own log across a restart. The live-service path
+  //    performs this step after the deletions instead (see the docblock).
+  if (detachRegistry === undefined) {
+    let registry = await readWorkspaceRegistry(roots)
+    if (registry !== undefined) {
+      const removable = plan.targets.filter((target) => !blocked.has(target.id)).map((target) => target.id)
+      const projected = detachFromRegistry(registry, removable)
+      if (projected.changes.length > 0) {
+        try {
+          await writeJsonAtomic(roots.workspaceRegistry, projected.registry)
+          result.registryChanges = projected.changes
+        } catch (error) {
+          result.failed.push({ id: '*', stage: 'registry', reason: String(error?.message ?? error) })
+        }
       }
     }
   }
@@ -628,6 +642,28 @@ export async function executeDeletion(roots, plan, options = {}) {
         result.deleted.push({ id: target.id, kind: 'projection-cache', path: cacheFile })
       } catch (error) {
         result.failed.push({ id: target.id, stage: 'projection-cache', reason: String(error?.message ?? error) })
+      }
+    }
+  }
+
+  // 3b. Live registry detach, after the deletions. Failures are REPORTED, not
+  //     fatal: the files are already gone, a stale accounting entry heals on
+  //     the next start (the registry prunes ids with no session header), and
+  //     declaring the whole deletion failed after the rows vanished would
+  //     mislead more than a warning does.
+  if (detachRegistry !== undefined) {
+    const removable = result.deleted
+      .filter((entry) => entry.kind === 'session-dir')
+      .map((entry) => entry.id)
+    if (removable.length > 0) {
+      try {
+        const detached = await detachRegistry(removable)
+        if (Array.isArray(detached?.changes)) result.registryChanges.push(...detached.changes)
+        for (const failure of Array.isArray(detached?.failures) ? detached.failures : []) {
+          result.warnings.push(`registry detach for ${failure?.id ?? '*'}: ${failure?.reason ?? 'unknown failure'}`)
+        }
+      } catch (error) {
+        result.warnings.push(`registry detach: ${String(error?.message ?? error)}`)
       }
     }
   }

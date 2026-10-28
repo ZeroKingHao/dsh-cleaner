@@ -531,3 +531,71 @@ test('executeDeletion keeps the registry intact when stopping is allowed to proc
   assert.equal(result.aborted, undefined)
   assert.equal(result.summary.sessionsDeleted, 1)
 })
+
+test('a live detachRegistry runs after the deletions and skips the registry file', async () => {
+  const { roots } = makeHome()
+  const dirA = writeSession(roots, '--ws-a--', USER_A, { id: USER_A })
+  const calls = []
+  writeFileSync(roots.workspaceRegistry, JSON.stringify({
+    global: { archivedSessionIds: [USER_A], pinnedSessionIds: [] },
+    tables: { workspaces: { w1: { sessionIds: [USER_A, USER_B] } } },
+  }))
+  const before = readFileSync(roots.workspaceRegistry, 'utf8')
+
+  const plan = await planDeletion(roots, [USER_A])
+  const result = await executeDeletion(roots, plan, {
+    stop: async () => ({ stillRunning: false }),
+    detachRegistry: async (ids) => {
+      calls.push([...ids])
+      return { changes: [{ where: 'workspaces[w1].sessionIds', removed: 1 }] }
+    },
+  })
+
+  // The service runs only after the files are gone, and only for ids whose
+  // directory deletion actually succeeded.
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0], [USER_A])
+  assert.equal(existsSync(dirA), false)
+  // The registry FILE is the service's authority now: this module must not
+  // race it with its own rewrite.
+  assert.equal(readFileSync(roots.workspaceRegistry, 'utf8'), before)
+  assert.deepEqual(result.registryChanges, [{ where: 'workspaces[w1].sessionIds', removed: 1 }])
+  assert.equal(result.failed.length, 0)
+  assert.equal(result.warnings.length, 0)
+})
+
+test('a failing live detachRegistry warns without failing the deletion', async () => {
+  const { roots } = makeHome()
+  writeSession(roots, '--ws-a--', USER_A, { id: USER_A })
+  const plan = await planDeletion(roots, [USER_A])
+  const result = await executeDeletion(roots, plan, {
+    stop: async () => ({ stillRunning: false }),
+    detachRegistry: async () => ({ changes: [], failures: [{ id: USER_A, reason: 'registry refused' }] }),
+  })
+  assert.equal(result.summary.sessionsDeleted, 1)
+  assert.equal(result.failed.length, 0, 'files are gone: a stale accounting entry is not a failure')
+  assert.equal(result.warnings.length, 1)
+  assert.match(result.warnings[0], /registry refused/)
+  // A throwing detacher is contained the same way.
+  writeSession(roots, '--ws-b--', USER_B, { id: USER_B })
+  const thrown = await executeDeletion(roots, await planDeletion(roots, [USER_B]), {
+    stop: async () => ({ stillRunning: false }),
+    detachRegistry: async () => { throw new Error('boom') },
+  })
+  assert.equal(thrown.summary.sessionsDeleted, 1)
+  assert.equal(thrown.warnings.length, 1)
+  assert.match(thrown.warnings[0], /boom/)
+})
+
+test('a live detachRegistry is not called when nothing was deleted', async () => {
+  const { roots } = makeHome()
+  writeSession(roots, '--ws-a--', USER_A, { id: USER_A })
+  let called = false
+  const plan = await planDeletion(roots, [USER_A])
+  const result = await executeDeletion(roots, plan, {
+    stop: async () => ({ stillRunning: true, reason: 'busy' }),
+    detachRegistry: async () => { called = true; return { changes: [] } },
+  })
+  assert.equal(result.aborted, true)
+  assert.equal(called, false)
+})

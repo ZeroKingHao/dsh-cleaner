@@ -10,16 +10,22 @@
  * rather than silently at load time inside the app.
  */
 import assert from 'node:assert/strict'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
+import { zstdCompressSync } from 'node:zlib'
 
 import * as plugin from '../src/index.js'
+import { rootsFor } from '../src/cleaner.js'
 
 /** Minimal Cordis context: records registrations, exposes nothing else. */
-function makeContext({ agents = new Map(), initiator } = {}) {
+function makeContext({ agents = new Map(), initiator, services } = {}) {
   const tools = new Map()
   const provided = new Map()
   const mounts = []
   const effects = []
+  const injections = []
 
   const ctx = {
     agents: {
@@ -44,8 +50,44 @@ function makeContext({ agents = new Map(), initiator } = {}) {
     get(key) {
       return key === 'remote' ? { $mount: async (contract) => { mounts.push(contract) } } : undefined
     },
+    // Only present when the test wants the plugin to see injected services
+    // (the live workspace registry): applies the callback immediately, the
+    // way Cordis does once every dependency has settled.
+    ...(services === undefined ? {} : {
+      inject(deps, callback) {
+        const scope = {}
+        for (const dep of deps) scope[dep] = services[dep]
+        const dispose = callback(scope)
+        injections.push({ deps, dispose })
+        return () => { for (const { dispose } of injections.splice(0)) dispose?.() }
+      },
+    }),
   }
-  return { ctx, tools, provided, mounts, effects }
+  return { ctx, tools, provided, mounts, effects, injections }
+}
+
+/** One deletable session inside a fresh DSH_HOME; returns its directory. */
+function makeSession(home, id) {
+  const roots = rootsFor(home)
+  const dir = path.join(roots.sessions, '--ws--', id)
+  mkdirSync(dir, { recursive: true })
+  mkdirSync(roots.projectionCache, { recursive: true })
+  writeFileSync(path.join(dir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(`${JSON.stringify({ id })}\n`)))
+  return dir
+}
+
+/** Run the body with DSH_HOME pointed at a throwaway home directory. */
+async function withTempHome(body) {
+  const home = mkdtempSync(path.join(tmpdir(), 'dsh-cleaner-plugin-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    return await body(home)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    rmSync(home, { recursive: true, force: true })
+  }
 }
 
 test('the Host module exports the Cordis plugin shape', () => {
@@ -210,4 +252,93 @@ test('unregistering the effect removes the Tool', () => {
   assert.ok(tools.has('session_delete'))
   effects[0].dispose()
   assert.equal(tools.has('session_delete'), false)
+})
+
+test('a live workspace registry detaches through the service and owns the file', async () => {
+  await withTempHome(async (home) => {
+    const id = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+    const dir = makeSession(home, id)
+    const roots = rootsFor(home)
+    writeFileSync(roots.workspaceRegistry, JSON.stringify({
+      global: { archivedSessionIds: [id], pinnedSessionIds: [] },
+      tables: { workspaces: { w1: { sessionIds: [id] } } },
+    }))
+    const fileBefore = readFileSync(roots.workspaceRegistry, 'utf8')
+
+    const calls = []
+    const registry = {
+      archivedSessionIds: [id],
+      pinnedSessionIds: [],
+      list: () => [{
+        id: 'w1',
+        sessionIds: [id],
+        detachSession: async (sessionId) => { calls.push(['detach', 'w1', sessionId]) },
+      }],
+      unarchiveSession: async (sessionId) => { calls.push(['unarchive', sessionId]) },
+      unpinSession: async (sessionId) => { calls.push(['unpin', sessionId]) },
+    }
+
+    const { ctx, provided } = makeContext({ services: { workspaceRegistry: registry } })
+    plugin.apply(ctx)
+    const service = provided.get('sessionCleaner')
+
+    const result = await service.delete([id], {})
+    assert.equal(result.ok, true)
+    assert.equal(result.registrySync, 'live-registry')
+    // Archive first, pin never (the id is not pinned), then the entity detach.
+    assert.deepEqual(calls, [['unarchive', id], ['detach', 'w1', id]])
+    assert.equal(existsSync(dir), false, 'the session files are deleted')
+    assert.equal(readFileSync(roots.workspaceRegistry, 'utf8'), fileBefore,
+      'while the registry service is live, this plugin must not write the file')
+    assert.deepEqual(result.registryChanges, [
+      { where: 'global.archivedSessionIds', removed: 1 },
+      { where: 'workspaces[w1].sessionIds', removed: 1 },
+    ])
+    assert.equal(result.warnings.length, 0)
+  })
+})
+
+test('a live registry that refuses only warns — the deletion itself stands', async () => {
+  await withTempHome(async (home) => {
+    const id = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+    const dir = makeSession(home, id)
+    const registry = {
+      archivedSessionIds: [],
+      pinnedSessionIds: [],
+      list: () => { throw new Error('registry exploded') },
+    }
+
+    const { ctx, provided } = makeContext({ services: { workspaceRegistry: registry } })
+    plugin.apply(ctx)
+    const service = provided.get('sessionCleaner')
+
+    const result = await service.delete([id], {})
+    assert.equal(result.ok, true, 'files are gone: a failing detach is a warning, not a failure')
+    assert.equal(existsSync(dir), false)
+    assert.equal(result.warnings.length, 1)
+    assert.match(result.warnings[0], /registry exploded/)
+  })
+})
+
+test('without a live registry the service falls back to editing the registry file', async () => {
+  await withTempHome(async (home) => {
+    const id = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+    const dir = makeSession(home, id)
+    const roots = rootsFor(home)
+    writeFileSync(roots.workspaceRegistry, JSON.stringify({
+      global: { archivedSessionIds: [], pinnedSessionIds: [] },
+      tables: { workspaces: { w1: { sessionIds: [id] } } },
+    }))
+
+    const { ctx, provided } = makeContext()
+    plugin.apply(ctx)
+    const service = provided.get('sessionCleaner')
+
+    const result = await service.delete([id], {})
+    assert.equal(result.ok, true)
+    assert.equal(result.registrySync, 'registry-file')
+    assert.equal(existsSync(dir), false)
+    const registry = JSON.parse(readFileSync(roots.workspaceRegistry, 'utf8'))
+    assert.deepEqual(registry.tables.workspaces.w1.sessionIds, [], 'the file fallback still detaches')
+  })
 })

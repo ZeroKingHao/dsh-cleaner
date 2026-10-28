@@ -42,7 +42,18 @@ DSH 本身没有任何删除会话的途径：`sessionPersistence` 只有 `creat
 - **不能删除当前打开的会话**：UI 禁用入口，Host 侧独立再拒一次（`guard` 参数），Tool 也拒绝把自己所在的会话作为目标。
 - **运行中的会话先停止再删**：否则内存里的 Agent 会继续往刚删掉的日志追加写入，残留一个半截会话。若在超时内无法停止，**整个操作中止，一个文件都不删**。
 - **递归删除子代理会话**：通过日志头部的 `parentSession` 字段展开全部后代，避免产生永远无法访问的孤儿数据。
-- **先摘注册表、后删文件**，并且计划中的注册表引用先摘除，保证界面不会出现「看得见、点开报错」的空壳行。
+- **注册表摘除走两条路**（见下节「删除如何立即反映到界面」）：宿主的 `workspaceRegistry` 服务在线时，摘除通过 `unarchiveSession` / `detachSession` 走**内存注册表**（它同时是 `workspace.json` 在删除期间的唯一写者），并在文件删除**之后**执行；服务不可用时回退为删除前原子改写 `workspace.json` 文件，保证重启后不会出现「看得见、点开报错」的空壳行。
+
+## 删除如何立即反映到界面
+
+DSH 侧边栏的会话行由两个数据源合成：行的**存在**来自客户端 `sessions` 服务的列表快照（只在连接建立时通过 `session/list` 拉取一次，而 Host 的 `session/list` 每次都实时扫盘），行的**分组/归档/置顶**来自 `workspaceController` 的 follow 流（内存注册表投影）。直接改磁盘文件两边都不会察觉——官方 README 明确把「外部变更延迟可见」列为已知限制。
+
+因此删除的收尾是两步正规通道：
+
+1. **Host 侧**（动态注入 `workspaceRegistry`，不在顶层 `inject` 里——缺服务的组合仍要能激活插件）：对每个已删 id 依次 `unarchiveSession`（幂等，顺带清置顶互斥）、`unpinSession`（如置顶）、对记账实体 `detachSession`。每次调用都更新内存注册表、持久化并向 follow 流推送增量。失败只记入结果的 `warnings`——文件已删，残留记账在下次启动时被宿主剪除，报「删除失败」反而误导。
+2. **客户端**（动态注入 `sessions` 服务）：删除成功后调用一次 `ctx.sessions.refresh()` 重新拉取 `session/list`；`mergeOrderedBaseline` 会把新 baseline 里消失的行从快照丢弃，侧边栏行当场消失。
+
+先删文件、后摘注册表的顺序是有意的：行的存在由快照决定，若先摘注册表，仍留在快照里的行会先闪现到「未分组」。Tool（`session_delete`）路径没有客户端配合，界面仍需等下一次连接或重启。
 
 ## 安装
 
@@ -53,7 +64,7 @@ DSH 本身没有任何删除会话的途径：`sessionPersistence` 只有 `creat
 ```jsonc
 // ~/.dsh/profiles/<profile>/package.json
 {
-  "dependencies": { "dsh-plugin-session-cleaner": "^0.2.0" },
+  "dependencies": { "dsh-plugin-session-cleaner": "^0.3.0" },
   "dsh": { "profile": { "bundles": [ /* ... */, "dsh-plugin-session-cleaner" ] } }
 }
 ```
@@ -70,7 +81,7 @@ DSH 本身没有任何删除会话的途径：`sessionPersistence` 只有 `creat
 node build/client.mjs                          # 构建 lib/
 node --test tests/cleaner.test.mjs \
            tests/plugin.test.mjs \
-           tests/client.test.mjs               # 51 个测试
+           tests/client.test.mjs               # 65 个测试
 ```
 
 `build/client.mjs` 是一个零依赖的极简打包器：DSH 的客户端模块系统每个包只加载**一个自包含的 `client.js`**（entry 与 chunk 之间不能同步 require 另一个相对 `client*.js`），所以相对 require 被内联，React / react-dom 则保留为平台模块请求，由 shell 冻结的模块表应答。

@@ -414,6 +414,9 @@ function renderMessages(React, t, messages) {
 
 module.exports = function createPanelPage(React, t, acquire, readFailure, primitives) {
   const { useState, useEffect, useMemo, useRef } = React
+  // Optional: called after a successful batch deletion so the client can
+  // re-pull its session list and drop the deleted rows from the sidebar.
+  const afterDelete = primitives?.afterDelete
 
   return function SessionCleanerPage() {
     const [state, setState] = useState({ phase: 'loading' })
@@ -517,6 +520,9 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
         if (result?.ok === false) {
           setNotice({ kind: 'error', text: t('panel.failed', { reason: result.error ?? 'unknown' }) })
         } else {
+          // The files are gone: refresh the client session list so the
+          // sidebar drops these rows without a restart.
+          try { afterDelete?.() } catch { /* best effort */ }
           setNotice({
             kind: 'done',
             text: t('panel.deleted', {
@@ -1317,6 +1323,30 @@ module.exports = function createPlugin(require) {
       /** Human-readable reason from the most recent acquire failure, if any. */
       let acquireFailure
 
+      /**
+       * The client's session-list snapshot, when this composition publishes
+       * one. The sidebar renders its rows from that snapshot, which the shell
+       * only re-pulls on connect — so after a deletion the rows would linger
+       * until the next restart even though the files are gone. One refresh()
+       * re-runs session/list (a live disk scan on the Host) and drops every
+       * row whose session no longer exists. Dynamic injection: a composition
+       * without the service simply keeps the restart-based behavior.
+       */
+      let sessionList
+      try {
+        if (typeof ctx.inject === 'function') {
+          ctx.inject(['sessions'], (scope) => { sessionList = scope.sessions })
+        }
+      } catch { /* optional service: nothing to refresh */ }
+
+      /** Best-effort session-list refresh after a successful deletion. */
+      const refreshSessionList = () => {
+        try {
+          const pending = sessionList?.refresh?.()
+          if (pending && typeof pending.catch === 'function') pending.catch(() => {})
+        } catch { /* a stale snapshot only delays the update to the next connect */ }
+      }
+
       const readFailure = () => acquireFailure
 
       /**
@@ -1494,6 +1524,9 @@ module.exports = function createPlugin(require) {
               setError(result.error ?? 'unknown failure')
               return
             }
+            // The files are gone: pull the client session list once so the
+            // row disappears now, not on the next restart.
+            refreshSessionList()
             confirmStore.dismiss()
           } catch (reason) {
             setError(String(reason?.message ?? reason))
@@ -1612,7 +1645,7 @@ module.exports = function createPlugin(require) {
         // to the shipped Plugins and Automation Tasks pages. `selectPanel(id)`
         // dispatches on this key, so a missing entry would make the sidebar
         // row throw on click — the two registrations below are one unit.
-        const page = createPanelPage(React, t, acquire, readFailure, { Modal, Button })
+        const page = createPanelPage(React, t, acquire, readFailure, { Modal, Button, afterDelete: refreshSessionList })
         ctx.slots.inject('main', () => ctx.slots.register({
           name: 'main',
           key: PANEL_ID,

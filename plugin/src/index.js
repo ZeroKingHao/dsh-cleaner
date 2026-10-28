@@ -78,6 +78,7 @@ function resultToWire(result) {
     registryChanges: result.registryChanges,
     searchIndexesRemoved: result.searchIndexesRemoved.map((entry) => entry.path),
     failed: result.failed,
+    warnings: result.warnings,
     summary: result.summary,
     humanBytes: formatBytes(result.summary?.bytesDeleted ?? 0),
   }
@@ -90,6 +91,16 @@ function resultToWire(result) {
 function createService(ctx) {
   const roots = rootsFor(resolveDshHome())
   const timeoutMs = stopTimeoutMs()
+
+  /**
+   * The live workspace registry, when the running DSH publishes one. Present,
+   * it becomes the single write authority over `workspace.json`: deleting ids
+   * through it updates the in-memory registry and pushes follow increments to
+   * the client, so deleted rows disappear from the sidebar without a restart.
+   * Writing the file ourselves beside it would race the registry's own
+   * read-modify-write and resurrect detached ids on its next change.
+   */
+  let liveRegistry
 
   /** Resolve a live agent for a session, if one is registered. */
   const liveAgent = (sessionId) => {
@@ -145,8 +156,60 @@ function createService(ctx) {
     }
   }
 
+  /**
+   * Detach deleted sessions through the LIVE registry service, so the running
+   * app updates its workspace projection immediately instead of on next start.
+   *
+   * Every call is idempotent on the registry side: unarchiving an id that is
+   * not archived resolves without writing, and `detachSession` filters a list
+   * that no longer carries the id. Pin and archive are mutually exclusive and
+   * archiving drops the pin, but both sets are checked anyway — belt against
+   * a registry whose invariants drifted. Failures are collected per id and
+   * reported as warnings: the files are already deleted at this point, and a
+   * stale accounting entry heals on the next start.
+   */
+  const detachViaRegistry = async (ids) => {
+    const registry = liveRegistry
+    const changes = []
+    const failures = []
+    if (registry === undefined) return { changes, failures }
+
+    let entities
+    try {
+      entities = registry.list()
+    } catch (error) {
+      return { changes, failures: [{ id: '*', reason: `registry list() failed: ${String(error?.message ?? error)}` }] }
+    }
+
+    for (const id of ids) {
+      try {
+        if (Array.isArray(registry.archivedSessionIds) && registry.archivedSessionIds.includes(id)) {
+          await registry.unarchiveSession(id)
+          changes.push({ where: 'global.archivedSessionIds', removed: 1 })
+        }
+        if (Array.isArray(registry.pinnedSessionIds) && registry.pinnedSessionIds.includes(id)) {
+          await registry.unpinSession(id)
+          changes.push({ where: 'global.pinnedSessionIds', removed: 1 })
+        }
+        for (const entity of entities) {
+          if (!Array.isArray(entity?.sessionIds) || !entity.sessionIds.includes(id)) continue
+          await entity.detachSession(id)
+          changes.push({ where: `workspaces[${String(entity.id)}].sessionIds`, removed: 1 })
+        }
+      } catch (error) {
+        failures.push({ id, reason: String(error?.message ?? error) })
+      }
+    }
+    return { changes, failures }
+  }
+
   return {
     dshHome: roots.dshHome,
+
+    /** Attach or detach the live registry service (see apply). */
+    bindRegistry(registry) {
+      liveRegistry = registry && typeof registry === 'object' ? registry : undefined
+    },
 
     /** Every session on disk with lightweight metadata, largest first. */
     async list() {
@@ -234,8 +297,20 @@ function createService(ctx) {
         }
       }
 
-      const result = await executeDeletion(roots, planned, { stop: stopSession })
-      return { ok: result.failed.length === 0 && result.aborted !== true, ...resultToWire(result) }
+      const hasLiveRegistry = liveRegistry !== undefined
+      const result = await executeDeletion(roots, planned, {
+        stop: stopSession,
+        ...(hasLiveRegistry ? { detachRegistry: detachViaRegistry } : {}),
+      })
+      return {
+        ok: result.failed.length === 0 && result.aborted !== true,
+        // Which authority detached the registry references: 'live-registry'
+        // means the running app's projection was updated in place (the client
+        // re-pulls its session list right after this), 'registry-file' is the
+        // offline fallback that edits workspace.json on disk.
+        registrySync: hasLiveRegistry ? 'live-registry' : 'registry-file',
+        ...resultToWire(result),
+      }
     },
   }
 }
@@ -327,6 +402,20 @@ export function apply(ctx) {
   // never mounts them itself.
   service.typertRemote = Object.freeze({ service, serviceKey: name, namespace: name })
   ctx.provide(name, service)
+
+  // Dynamic — NOT part of `inject` — so a composition without the workspace
+  // registry still activates this plugin and keeps the file-based fallback.
+  // While the service is up it is the only writer of workspace.json during
+  // deletions (see createService). The disposable is kept for symmetry with
+  // Cordis' effect semantics but the plugin lives as long as the host.
+  try {
+    if (typeof ctx.inject === 'function') {
+      ctx.inject(['workspaceRegistry'], (scope) => {
+        service.bindRegistry(scope?.workspaceRegistry)
+        return () => { service.bindRegistry(undefined) }
+      })
+    }
+  } catch { /* the composition publishes no workspace registry */ }
 
   ctx.effect(() => {
     const holder = ctx.agents?.currentInitiator?.()
