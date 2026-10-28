@@ -417,6 +417,11 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
   // Optional: called after a successful batch deletion so the client can
   // re-pull its session list and drop the deleted rows from the sidebar.
   const afterDelete = primitives?.afterDelete
+  // Optional: fires when a deletion happens OUTSIDE this panel (the sidebar
+  // menu dialog). This page's list is a scan snapshot taken on mount, so it
+  // subscribes and re-scans — otherwise deleted rows would linger here while
+  // the sidebar has already dropped them.
+  const deletionSignal = primitives?.deletionSignal
 
   return function SessionCleanerPage() {
     const [state, setState] = useState({ phase: 'loading' })
@@ -457,6 +462,13 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
     }
 
     useEffect(() => { load() }, [])
+
+    // Deletions from the sidebar menu invalidate this snapshot: re-scan when
+    // signaled. The cleanup happens through the subscription's disposer.
+    useEffect(() => {
+      if (deletionSignal === undefined) return undefined
+      return deletionSignal.subscribe(() => { load() })
+    }, [])
 
     // Escape closes the preview, matching the platform Modal's behaviour.
     useEffect(() => {
@@ -517,6 +529,9 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
       }
       try {
         const result = unwrap(await service.delete(ids, {}))
+        // Reload FIRST and report afterwards: load() clears the notice line,
+        // so setting it before the reload would swallow the report entirely.
+        await load()
         if (result?.ok === false) {
           setNotice({ kind: 'error', text: t('panel.failed', { reason: result.error ?? 'unknown' }) })
         } else {
@@ -531,7 +546,6 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
             }),
           })
         }
-        await load()
       } catch (reason) {
         setNotice({ kind: 'error', text: t('panel.failed', { reason: String(reason?.message ?? reason) }) })
       } finally {
@@ -866,6 +880,11 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
           key: 'toggle', type: 'button', onClick: toggleAll, style: buttonStyle,
         }, allVisibleSelected ? t('panel.clear') : t('panel.selectAll')),
         React.createElement('button', {
+          // The list is a snapshot; a manual re-scan also picks up deletions
+          // made through the model Tool, which no client sees happen.
+          key: 'refresh', type: 'button', disabled: busy, onClick: load, style: buttonStyle,
+        }, t('panel.refresh')),
+        React.createElement('button', {
           key: 'delete',
           type: 'button',
           disabled: busy || selected.size === 0,
@@ -1141,6 +1160,7 @@ const MESSAGES = Object.freeze({
     'panel.search': 'Filter by title, id, workspace or path',
     'panel.selectAll': 'Select all shown',
     'panel.clear': 'Clear selection',
+    'panel.refresh': 'Rescan',
     'panel.delete': 'Delete {count} selected ({size})',
     'panel.deleting': 'Deleting…',
     'panel.deleted': 'Deleted {count} session(s), freed {size}.',
@@ -1189,6 +1209,7 @@ const MESSAGES = Object.freeze({
     'panel.search': '按标题、id、工作区或路径筛选',
     'panel.selectAll': '全选当前列表',
     'panel.clear': '清空选择',
+    'panel.refresh': '重新扫描',
     'panel.delete': '删除选中的 {count} 个（{size}）',
     'panel.deleting': '正在删除…',
     'panel.deleted': '已删除 {count} 个会话，释放 {size}。',
@@ -1271,6 +1292,26 @@ function createConfirmStore() {
   }
 }
 
+/**
+ * A deletion happened somewhere outside the panel (the sidebar menu dialog).
+ *
+ * The panel's list is a scan snapshot taken on mount; without this signal the
+ * rows of sessions deleted through the menu would linger in an open panel
+ * until it is reopened. The panel subscribes on mount and re-scans.
+ */
+function createDeletionSignal() {
+  const listeners = new Set()
+  return {
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
+    emit() {
+      for (const listener of [...listeners]) listener()
+    },
+  }
+}
+
 module.exports = function createPlugin(require) {
   const React = require('react')
 
@@ -1292,6 +1333,9 @@ module.exports = function createPlugin(require) {
 
   /** One live dialog per activation; the overlay entry reads it. */
   const confirmStore = createConfirmStore()
+
+  /** Broadcasts deletions performed outside the panel (see createDeletionSignal). */
+  const deletionSignal = createDeletionSignal()
 
   /** Subscribe a component to the pending confirm request. */
   function useConfirmRequest() {
@@ -1525,8 +1569,10 @@ module.exports = function createPlugin(require) {
               return
             }
             // The files are gone: pull the client session list once so the
-            // row disappears now, not on the next restart.
+            // row disappears now, not on the next restart — and tell an open
+            // cleanup panel to re-scan, since its list is a mount snapshot.
             refreshSessionList()
+            deletionSignal.emit()
             confirmStore.dismiss()
           } catch (reason) {
             setError(String(reason?.message ?? reason))
@@ -1645,7 +1691,12 @@ module.exports = function createPlugin(require) {
         // to the shipped Plugins and Automation Tasks pages. `selectPanel(id)`
         // dispatches on this key, so a missing entry would make the sidebar
         // row throw on click — the two registrations below are one unit.
-        const page = createPanelPage(React, t, acquire, readFailure, { Modal, Button, afterDelete: refreshSessionList })
+        const page = createPanelPage(React, t, acquire, readFailure, {
+          Modal,
+          Button,
+          afterDelete: refreshSessionList,
+          deletionSignal,
+        })
         ctx.slots.inject('main', () => ctx.slots.register({
           name: 'main',
           key: PANEL_ID,

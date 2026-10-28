@@ -49,12 +49,13 @@ function reactStub() {
 /**
  * A React stub with REAL hook state: setters update a shared slot store, and
  * the test re-invokes the component to observe the next state — enough to
- * walk the panel through its loading → ready → preview-open states. Effects
- * run once: the page's only effect is mount-only.
+ * walk the panel through its loading → ready → preview-open states. Every
+ * effect position runs exactly once, on its first frame.
  */
 function statefulReactStub() {
   const slots = []
-  const state = { cursor: 0, effectsRun: false }
+  const effectSlots = new Set()
+  const state = { cursor: 0, effectCursor: 0 }
   const React = {
     createElement: (type, props, ...children) => ({ type, props, children }),
     Fragment: Symbol('Fragment'),
@@ -64,9 +65,13 @@ function statefulReactStub() {
       if (!(slot in slots)) slots[slot] = typeof initial === 'function' ? initial() : initial
       return [slots[slot], (value) => { slots[slot] = typeof value === 'function' ? value(slots[slot]) : value }]
     },
-    useEffect: (effect) => {
-      if (!state.effectsRun) {
-        state.effectsRun = true
+    // Every effect position runs once, on its first frame — enough for the
+    // page's mount-only effects (initial scan, deletion-signal subscription).
+    useEffect(effect) {
+      const slot = state.effectCursor
+      state.effectCursor += 1
+      if (!effectSlots.has(slot)) {
+        effectSlots.add(slot)
         effect()
       }
     },
@@ -75,6 +80,7 @@ function statefulReactStub() {
   }
   const render = (component, props = {}) => {
     state.cursor = 0
+    state.effectCursor = 0
     return component(props)
   }
   return { React, render }
@@ -913,6 +919,125 @@ test('a text filter auto-expands matching groups and keeps the tree shape', asyn
   assert.equal(collect(none).filter((node) => node.type === 'label').length, 0)
   const paragraphs = collect(none).filter((node) => node.type === 'p').map((node) => node.children.flat().join(''))
   assert.ok(paragraphs.some((text) => text.includes('No session matches')))
+})
+
+test('a menu deletion signals an open cleanup panel to re-scan', async () => {
+  const { React, render } = statefulReactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return { createPortal: (node) => node }
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const VICTIM = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const SURVIVOR = 'session-cccccccc-1111-2222-3333-444444444444'
+  const listCalls = []
+  const service = {
+    // Each scan reflects the disk: the second call no longer sees VICTIM.
+    list: async () => {
+      listCalls.push(1)
+      const sessions = [
+        { id: SURVIVOR, workspaceKey: '--ws--', bytes: 100, humanBytes: '100 B', parent: undefined, cwd: 'F:\\alpha', title: 'Survivor', createdAt: 1000 },
+      ]
+      if (listCalls.length === 1) {
+        sessions.unshift({ id: VICTIM, workspaceKey: '--ws--', bytes: 10, humanBytes: '10 B', parent: undefined, cwd: 'F:\\alpha', title: 'Victim', createdAt: 2000 })
+      }
+      return { sessions }
+    },
+    preview: async () => ({ targetCount: 1, humanBytes: '10 B' }),
+    delete: async () => ({ ok: true, summary: { sessionsDeleted: 1, bytesDeleted: 10 } }),
+  }
+  const scope = { 'remote.sessionCleaner': service, sessions: { refresh: async () => {} } }
+  const registrations = []
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback(scope) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) { registrations.push({ options, value }); return () => {} },
+    },
+  })
+  const menu = registrations.find((entry) => entry.options.name === 'sidebar.workspaces.session.menu.item')
+  const overlay = registrations.find((entry) => entry.options.name === 'shell.overlay')
+  const panel = registrations.find((entry) => entry.options.name === 'main')
+
+  // The panel mounts and scans once (both sessions on disk).
+  render(panel.value)
+  await settle()
+  render(panel.value)
+  assert.equal(listCalls.length, 1)
+  const headersBefore = collect(render(panel.value)).filter((node) => node.props?.role === 'group')
+  assert.ok(headersBefore.some((node) => collect(node).some((span) => span.type === 'span' && String(span.children[0]).includes('2 session'))))
+
+  // Delete VICTIM through the SIDEBAR MENU dialog — not through the panel.
+  const row = menu.value({ sessionId: VICTIM, displayTitle: 'Victim', useMenuOpenState: () => [true, () => {}] })
+  await row.props.onClick()
+  await settle()
+  const dialog = overlay.value({})
+  const confirm = collect(dialog).find((node) =>
+    node.type === 'button' && node.children.flat().includes('Delete permanently'))
+  await confirm.props.onClick()
+  await settle()
+  await settle()
+
+  // The open panel re-scanned on the signal: VICTIM is gone from its list.
+  assert.equal(listCalls.length, 2, 'the menu deletion must trigger a panel re-scan')
+  const headersAfter = collect(render(panel.value)).filter((node) => node.props?.role === 'group')
+  assert.ok(headersAfter.some((node) => collect(node).some((span) => span.type === 'span' && String(span.children[0]).includes('1 session'))),
+    'the panel group stats must reflect the survivor only')
+})
+
+test('the panel keeps its deletion report after reloading its list', async () => {
+  const { React, render } = statefulReactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return { createPortal: (node) => node }
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const TARGET = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const listCalls = []
+  const service = {
+    list: async () => {
+      listCalls.push(1)
+      return { sessions: listCalls.length === 1
+        ? [{ id: TARGET, workspaceKey: '--ws--', bytes: 10, humanBytes: '10 B', parent: undefined, cwd: 'F:\\alpha', title: 'Victim', createdAt: 2000 }]
+        : [] }
+    },
+    delete: async () => ({ ok: true, summary: { sessionsDeleted: 1, bytesDeleted: 10 } }),
+  }
+  const scope = { 'remote.sessionCleaner': service, sessions: { refresh: async () => {} } }
+  const registrations = []
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback(scope) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) { registrations.push({ options, value }); return () => {} },
+    },
+  })
+  const panel = registrations.find((entry) => entry.options.name === 'main')
+
+  render(panel.value)
+  await settle()
+  // Select the session through its group checkbox, then press delete.
+  const header = collect(render(panel.value)).find((node) => node.props?.role === 'group')
+  collect(header).find((node) => node.type === 'input').props.onChange()
+  const deleteButton = collect(render(panel.value))
+    .find((node) => node.type === 'button' && node.children.flat().join('').includes('Delete 1 selected'))
+  await deleteButton.props.onClick()
+  await settle()
+  await settle()
+
+  assert.equal(listCalls.length, 2, 'the panel reloads after its own deletion')
+  const notices = collect(render(panel.value))
+    .filter((node) => node.type === 'p')
+    .map((node) => node.children.flat().join(''))
+  assert.ok(notices.some((text) => text.includes('Deleted 1 session')), 'the report must survive the reload that follows it')
 })
 
 test('renderMessages lays out both sides of a transcript', () => {

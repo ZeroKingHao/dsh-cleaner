@@ -51,9 +51,9 @@ DSH 侧边栏的会话行由两个数据源合成：行的**存在**来自客户
 因此删除的收尾是两步正规通道：
 
 1. **Host 侧**（动态注入 `workspaceRegistry`，不在顶层 `inject` 里——缺服务的组合仍要能激活插件）：对每个已删 id 依次 `unarchiveSession`（幂等，顺带清置顶互斥）、`unpinSession`（如置顶）、对记账实体 `detachSession`。每次调用都更新内存注册表、持久化并向 follow 流推送增量。失败只记入结果的 `warnings`——文件已删，残留记账在下次启动时被宿主剪除，报「删除失败」反而误导。
-2. **客户端**（动态注入 `sessions` 服务）：删除成功后调用一次 `ctx.sessions.refresh()` 重新拉取 `session/list`；`mergeOrderedBaseline` 会把新 baseline 里消失的行从快照丢弃，侧边栏行当场消失。
+2. **客户端**（动态注入 `sessions` 服务）：删除成功后调用一次 `ctx.sessions.refresh()` 重新拉取 `session/list`；`mergeOrderedBaseline` 会把新 baseline 里消失的行从快照丢弃，侧边栏行当场消失。与此同时，客户端内的**删除信号**会通知已打开的清理面板重扫——面板的列表是挂载时的扫描快照，不重扫的话菜单删除的行会残留到面板重开为止；面板工具栏的「重新扫描」按钮兜住模型 Tool 删除这类任何客户端都看不到的变更。
 
-先删文件、后摘注册表的顺序是有意的：行的存在由快照决定，若先摘注册表，仍留在快照里的行会先闪现到「未分组」。Tool（`session_delete`）路径没有客户端配合，界面仍需等下一次连接或重启。
+先删文件、后摘注册表的顺序是有意的：行的存在由快照决定，若先摘注册表，仍留在快照里的行会先闪现到「未分组」。Tool（`session_delete`）路径没有客户端配合，侧边栏仍需等下一次连接或重启（面板可用「重新扫描」手动对齐）。
 
 ## 安装
 
@@ -64,7 +64,7 @@ DSH 侧边栏的会话行由两个数据源合成：行的**存在**来自客户
 ```jsonc
 // ~/.dsh/profiles/<profile>/package.json
 {
-  "dependencies": { "dsh-plugin-session-cleaner": "^0.3.0" },
+  "dependencies": { "dsh-plugin-session-cleaner": "^0.3.1" },
   "dsh": { "profile": { "bundles": [ /* ... */, "dsh-plugin-session-cleaner" ] } }
 }
 ```
@@ -81,7 +81,7 @@ DSH 侧边栏的会话行由两个数据源合成：行的**存在**来自客户
 node build/client.mjs                          # 构建 lib/
 node --test tests/cleaner.test.mjs \
            tests/plugin.test.mjs \
-           tests/client.test.mjs               # 65 个测试
+           tests/client.test.mjs               # 67 个测试
 ```
 
 `build/client.mjs` 是一个零依赖的极简打包器：DSH 的客户端模块系统每个包只加载**一个自包含的 `client.js`**（entry 与 chunk 之间不能同步 require 另一个相对 `client*.js`），所以相对 require 被内联，React / react-dom 则保留为平台模块请求，由 shell 冻结的模块表应答。
