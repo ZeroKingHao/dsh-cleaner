@@ -182,6 +182,14 @@ function createService(ctx) {
     }
 
     for (const id of ids) {
+      // Remove the row from the client BEFORE the accounting detach. The
+      // detach pushes a follow increment that re-roots a still-snapshotted
+      // row into Ungrouped, where it lingers until the list refresh lands —
+      // the event makes the client drop the row locally first, with no RPC
+      // round trip. It is the same event the shipped controller emits when it
+      // disposes a session; if the gateway does not relay it, behavior falls
+      // back to the brief Ungrouped flash, never worse.
+      try { ctx.emit?.('api-session/removed', id) } catch { /* advisory */ }
       try {
         if (Array.isArray(registry.archivedSessionIds) && registry.archivedSessionIds.includes(id)) {
           await registry.unarchiveSession(id)

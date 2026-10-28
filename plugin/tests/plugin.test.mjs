@@ -26,8 +26,10 @@ function makeContext({ agents = new Map(), initiator, services } = {}) {
   const mounts = []
   const effects = []
   const injections = []
+  const events = []
 
   const ctx = {
+    emit(name, ...args) { events.push([name, ...args]) },
     agents: {
       get: (id) => agents.get(id),
       ...(initiator === undefined ? {} : { currentInitiator: () => initiator }),
@@ -63,7 +65,7 @@ function makeContext({ agents = new Map(), initiator, services } = {}) {
       },
     }),
   }
-  return { ctx, tools, provided, mounts, effects, injections }
+  return { ctx, tools, provided, mounts, effects, injections, events }
 }
 
 /** One deletable session inside a fresh DSH_HOME; returns its directory. */
@@ -266,19 +268,30 @@ test('a live workspace registry detaches through the service and owns the file',
     const fileBefore = readFileSync(roots.workspaceRegistry, 'utf8')
 
     const calls = []
+    // Set after makeContext returns; lets the registry stubes assert that the
+    // client-removal event has already been emitted by the time any registry
+    // mutation starts.
+    const eventsBox = { current: null }
+    const expectRemovalEventFirst = (stage) => {
+      assert.ok(
+        eventsBox.current?.some(([name]) => name === 'api-session/removed'),
+        `the removal event must precede the ${stage} mutation`,
+      )
+    }
     const registry = {
       archivedSessionIds: [id],
       pinnedSessionIds: [],
       list: () => [{
         id: 'w1',
         sessionIds: [id],
-        detachSession: async (sessionId) => { calls.push(['detach', 'w1', sessionId]) },
+        detachSession: async (sessionId) => { expectRemovalEventFirst('detach'); calls.push(['detach', 'w1', sessionId]) },
       }],
-      unarchiveSession: async (sessionId) => { calls.push(['unarchive', sessionId]) },
-      unpinSession: async (sessionId) => { calls.push(['unpin', sessionId]) },
+      unarchiveSession: async (sessionId) => { expectRemovalEventFirst('unarchive'); calls.push(['unarchive', sessionId]) },
+      unpinSession: async (sessionId) => { expectRemovalEventFirst('unpin'); calls.push(['unpin', sessionId]) },
     }
 
-    const { ctx, provided } = makeContext({ services: { workspaceRegistry: registry } })
+    const { ctx, provided, events } = makeContext({ services: { workspaceRegistry: registry } })
+    eventsBox.current = events
     plugin.apply(ctx)
     const service = provided.get('sessionCleaner')
 
@@ -287,6 +300,8 @@ test('a live workspace registry detaches through the service and owns the file',
     assert.equal(result.registrySync, 'live-registry')
     // Archive first, pin never (the id is not pinned), then the entity detach.
     assert.deepEqual(calls, [['unarchive', id], ['detach', 'w1', id]])
+    assert.equal(events.filter(([name]) => name === 'api-session/removed').length, 1,
+      'one removal event per deleted session')
     assert.equal(existsSync(dir), false, 'the session files are deleted')
     assert.equal(readFileSync(roots.workspaceRegistry, 'utf8'), fileBefore,
       'while the registry service is live, this plugin must not write the file')

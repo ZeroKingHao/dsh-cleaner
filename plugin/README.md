@@ -50,7 +50,7 @@ DSH 侧边栏的会话行由两个数据源合成：行的**存在**来自客户
 
 因此删除的收尾是两步正规通道：
 
-1. **Host 侧**（动态注入 `workspaceRegistry`，不在顶层 `inject` 里——缺服务的组合仍要能激活插件）：对每个已删 id 依次 `unarchiveSession`（幂等，顺带清置顶互斥）、`unpinSession`（如置顶）、对记账实体 `detachSession`。每次调用都更新内存注册表、持久化并向 follow 流推送增量。失败只记入结果的 `warnings`——文件已删，残留记账在下次启动时被宿主剪除，报「删除失败」反而误导。
+1. **Host 侧**（动态注入 `workspaceRegistry`，不在顶层 `inject` 里——缺服务的组合仍要能激活插件）：对每个已删 id 先 `ctx.emit('api-session/removed', id)`——宿主 session-controller 释放会话时用的同一个事件，客户端收到后在**本地**移除该行，无 RPC 往返；随后依次 `unarchiveSession`（幂等，顺带清置顶互斥）、`unpinSession`（如置顶）、对记账实体 `detachSession`。emit 必须先于 registry 调用：detach 推送的 follow 增量会把仍留在快照里的行赶到「未分组」，直到 refresh 落地——先 emit，行在增量到达前就已消失。每次 registry 调用都更新内存注册表、持久化并向 follow 流推送增量；调用失败只记入结果的 `warnings`——文件已删，残留记账在下次启动时被宿主剪除，报「删除失败」反而误导。若网关不转发插件 emit 的该事件，行为退化为短暂的「未分组」闪现，不会更糟。
 2. **客户端**（动态注入 `sessions` 服务）：删除成功后调用一次 `ctx.sessions.refresh()` 重新拉取 `session/list`；`mergeOrderedBaseline` 会把新 baseline 里消失的行从快照丢弃，侧边栏行当场消失。与此同时，客户端内的**删除信号**会通知已打开的清理面板重扫——面板的列表是挂载时的扫描快照，不重扫的话菜单删除的行会残留到面板重开为止；面板工具栏的「重新扫描」按钮兜住模型 Tool 删除这类任何客户端都看不到的变更。
 
 先删文件、后摘注册表的顺序是有意的：行的存在由快照决定，若先摘注册表，仍留在快照里的行会先闪现到「未分组」。Tool（`session_delete`）路径没有客户端配合，侧边栏仍需等下一次连接或重启（面板可用「重新扫描」手动对齐）。
@@ -64,7 +64,7 @@ DSH 侧边栏的会话行由两个数据源合成：行的**存在**来自客户
 ```jsonc
 // ~/.dsh/profiles/<profile>/package.json
 {
-  "dependencies": { "dsh-plugin-session-cleaner": "^0.3.1" },
+  "dependencies": { "dsh-plugin-session-cleaner": "^0.3.2" },
   "dsh": { "profile": { "bundles": [ /* ... */, "dsh-plugin-session-cleaner" ] } }
 }
 ```
