@@ -335,13 +335,24 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
     const [previewSize, setPreviewSize] = useState(undefined)
     const previewPanelRef = useRef(null)
 
-    const load = async () => {
-      setState({ phase: 'loading' })
-      setNotice(undefined)
+    /**
+     * (Re)scan the Host's disk. The quiet variant is the post-delete
+     * reconciliation: it keeps the current list, notice and dshHome on screen
+     * while the scan is in flight, and on failure keeps them too — the rows
+     * dropped optimistically after the delete are a better guess than a
+     * loading flash over an empty list.
+     */
+    const load = async ({ quiet = false } = {}) => {
+      if (!quiet) {
+        setState({ phase: 'loading' })
+        setNotice(undefined)
+      }
       const service = await acquire()
       if (service === undefined) {
-        const reason = readFailure?.()
-        setState({ phase: 'error', error: reason === undefined ? t('panel.serviceMissing') : t('service.mountFailed', { reason }) })
+        if (!quiet) {
+          const reason = readFailure?.()
+          setState({ phase: 'error', error: reason === undefined ? t('panel.serviceMissing') : t('panel.service.mountFailed', { reason }) })
+        }
         return
       }
       try {
@@ -349,7 +360,7 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
         setState({ phase: 'ready', sessions: data?.sessions ?? [], dshHome: data?.dshHome })
         setSelected(new Set())
       } catch (reason) {
-        setState({ phase: 'error', error: String(reason?.message ?? reason) })
+        if (!quiet) setState({ phase: 'error', error: String(reason?.message ?? reason) })
       }
     }
 
@@ -421,15 +432,37 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
       }
       try {
         const result = unwrap(await service.delete(ids, {}))
-        // Reload FIRST and report afterwards: load() clears the notice line,
-        // so setting it before the reload would swallow the report entirely.
-        await load()
+        const deletedIds = new Set(
+          (Array.isArray(result?.deleted) ? result.deleted : [])
+            .map((entry) => entry?.id)
+            .filter((id) => typeof id === 'string'),
+        )
+        if (deletedIds.size > 0) {
+          // Optimistic removal: the Host confirmed these deletions, so the
+          // rows drop the moment the RPC returns instead of after the
+          // reconciliation scan below (a full disk walk that flashes the
+          // loading state on large profiles). A refused or partially failed
+          // delete never reaches here with the un-deleted ids included, so
+          // surviving rows stay on screen until the scan reconciles them.
+          setState((current) => (current.phase === 'ready'
+            ? { ...current, sessions: current.sessions.filter((session) => !deletedIds.has(session.id)) }
+            : current))
+          const without = (current) => {
+            const next = new Set(current)
+            for (const id of deletedIds) next.delete(id)
+            return next
+          }
+          setSelected(without)
+          setOpenSessions(without)
+          // Hand the CONFIRMED ids to the client regardless of the batch
+          // outcome — a partially failed delete still deleted these, and
+          // leaving them on the sidebar (see forgetSessions) parks them in
+          // Ungrouped until the next restart.
+          try { afterDelete?.([...deletedIds]) } catch { /* best effort */ }
+        }
         if (result?.ok === false) {
           setNotice({ kind: 'error', text: t('panel.failed', { reason: result.error ?? 'unknown' }) })
         } else {
-          // The files are gone: refresh the client session list so the
-          // sidebar drops these rows without a restart.
-          try { afterDelete?.() } catch { /* best effort */ }
           setNotice({
             kind: 'done',
             text: t('panel.deleted', {
@@ -438,6 +471,10 @@ module.exports = function createPanelPage(React, t, acquire, readFailure, primit
             }),
           })
         }
+        // Reconcile behind the optimistic update: the scan replaces the
+        // snapshot (and picks up deletions made elsewhere) without a loading
+        // flash, and the quiet path leaves the report above on screen.
+        await load({ quiet: true })
       } catch (reason) {
         setNotice({ kind: 'error', text: t('panel.failed', { reason: String(reason?.message ?? reason) }) })
       } finally {

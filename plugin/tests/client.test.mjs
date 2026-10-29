@@ -418,6 +418,7 @@ test('a successful delete re-pulls the client session list once', async () => {
   })
 
   const refreshes = []
+  const forgotten = []
   const service = {
     preview: async () => ({ targetCount: 1, humanBytes: '12.0 KiB' }),
     delete: async () => ({ ok: true }),
@@ -425,9 +426,13 @@ test('a successful delete re-pulls the client session list once', async () => {
   const scope = {
     'remote.sessionCleaner': service,
     // The client's session-list snapshot service (api-session-controller):
-    // refresh() re-runs session/list on the Host and drops rows whose
-    // session files no longer exist.
-    sessions: { refresh: async () => { refreshes.push(1) } },
+    // refresh() re-runs session/list on the Host; handleSessionRemoved is the
+    // shipped forwarded-event handler, which the plugin calls directly after
+    // the refresh so the row cannot be resurrected by the merged baseline.
+    sessions: {
+      refresh: async () => { refreshes.push(1) },
+      handleSessionRemoved: (id) => { forgotten.push(id) },
+    },
   }
   const registrations = []
   plugin.apply({
@@ -458,6 +463,191 @@ test('a successful delete re-pulls the client session list once', async () => {
   await new Promise((resolve) => setImmediate(resolve))
 
   assert.equal(refreshes.length, 1, 'exactly one session-list refresh after a deletion')
+  assert.deepEqual(forgotten, [sessionId], 'the deleted session is removed from the client snapshot')
+})
+
+test('the snapshot removal lands only after the baseline refresh settles', async () => {
+  const { React, reactDom } = reactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return reactDom
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const events = []
+  let releaseRefresh
+  const service = {
+    preview: async () => ({ targetCount: 1, humanBytes: '12.0 KiB' }),
+    delete: async () => ({ ok: true }),
+  }
+  const scope = {
+    'remote.sessionCleaner': service,
+    sessions: {
+      // The refresh stays in flight until the test releases it: the removal
+      // must NOT be recorded while the baseline is still being pulled —
+      // refreshList() discards mutations recorded before the pull lands,
+      // which is exactly how a deleted row used to survive in Ungrouped.
+      refresh: () => new Promise((resolve) => {
+        events.push('refresh-started')
+        releaseRefresh = () => { events.push('refresh-settled'); resolve() }
+      }),
+      handleSessionRemoved: (id) => { events.push(`removed:${id}`) },
+    },
+  }
+  const registrations = []
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback(scope) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) { registrations.push({ options, value }); return () => {} },
+    },
+  })
+  const menu = registrations.find((entry) => entry.options.name === 'sidebar.workspaces.session.menu.item')
+  const overlay = registrations.find((entry) => entry.options.name === 'shell.overlay')
+
+  const sessionId = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const row = menu.value({ sessionId, displayTitle: 'A session', useMenuOpenState: () => [true, () => {}] })
+  await row.props.onClick()
+  await settle()
+  const dialog = overlay.value({})
+  const confirm = collect(dialog).find((node) =>
+    node.type === 'button' && node.children.flat().includes('Delete permanently'))
+  await confirm.props.onClick()
+  await settle()
+
+  assert.deepEqual(events, ['refresh-started'],
+    'no removal while the refresh is in flight — it would be discarded on landing')
+
+  releaseRefresh()
+  await settle()
+  assert.deepEqual(events, ['refresh-started', 'refresh-settled', `removed:${sessionId}`],
+    'the removal is recorded after the refresh settles, into the next replayed mutation array')
+})
+
+test('the snapshot guard re-removes known-deleted ids after any snapshot change', async () => {
+  const { React, reactDom } = reactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return reactDom
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const VICTIM = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const SURVIVOR = 'session-cccccccc-1111-2222-3333-444444444444'
+  const removals = []
+  let snapshotItems = [SURVIVOR]
+  const snapshotListeners = new Set()
+  const service = {
+    preview: async () => ({ targetCount: 1, humanBytes: '12.0 KiB' }),
+    delete: async () => ({ ok: true }),
+  }
+  const scope = {
+    'remote.sessionCleaner': service,
+    sessions: {
+      refresh: async () => {},
+      handleSessionRemoved: (id) => { removals.push(id) },
+      subscribe: (listener) => {
+        snapshotListeners.add(listener)
+        return () => snapshotListeners.delete(listener)
+      },
+      getListSnapshot: () => ({ items: snapshotItems.map((id) => ({ sessionId: id })) }),
+    },
+  }
+  const registrations = []
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback(scope) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) { registrations.push({ options, value }); return () => {} },
+    },
+  })
+  const menu = registrations.find((entry) => entry.options.name === 'sidebar.workspaces.session.menu.item')
+  const overlay = registrations.find((entry) => entry.options.name === 'shell.overlay')
+
+  const row = menu.value({ sessionId: VICTIM, displayTitle: 'Victim', useMenuOpenState: () => [true, () => {}] })
+  await row.props.onClick()
+  await settle()
+  const dialog = overlay.value({})
+  const confirm = collect(dialog).find((node) =>
+    node.type === 'button' && node.children.flat().includes('Delete permanently'))
+  await confirm.props.onClick()
+  await settle()
+  assert.deepEqual(removals, [VICTIM], 'the deletion forgets the row once through the refresh chain')
+
+  // A baseline rebuild (reconnect, another consumer's refresh) resurrects the
+  // deleted-but-attached row into the snapshot: the guard must drop it again.
+  snapshotItems = [VICTIM, SURVIVOR]
+  for (const listener of [...snapshotListeners]) listener()
+  assert.deepEqual(removals, [VICTIM, VICTIM], 'the guard re-removes the resurrected row')
+
+  // Convergence: once the snapshot no longer carries the id, notifications
+  // must not recurse into further removals.
+  snapshotItems = [SURVIVOR]
+  for (const listener of [...snapshotListeners]) listener()
+  assert.deepEqual(removals, [VICTIM, VICTIM], 'the guard stops once the row is gone')
+})
+
+test('a partially failed panel delete still forgets the confirmed ids', async () => {
+  const { React, render } = statefulReactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return { createPortal: (node) => node }
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const VICTIM = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const STUCK = 'session-bbbbbbbb-1111-2222-3333-444444444444'
+  const row = (id, title, bytes) => ({
+    id, workspaceKey: '--ws--', bytes, humanBytes: `${bytes} B`, parent: undefined, cwd: 'F:\\alpha', title, createdAt: 2000,
+  })
+  const forgotten = []
+  const service = {
+    list: async () => ({ sessions: [row(VICTIM, 'Victim', 10), row(STUCK, 'Stuck', 20)] }),
+    delete: async () => ({
+      ok: false,
+      error: 'one session is still running',
+      // The Host only lists ids it actually deleted — the batch failed overall.
+      deleted: [{ id: VICTIM, kind: 'session-dir', bytes: 10 }],
+      failed: [{ id: STUCK, stage: 'stop', reason: 'session is still running' }],
+      summary: { sessionsDeleted: 1, bytesDeleted: 10 },
+    }),
+  }
+  const scope = {
+    'remote.sessionCleaner': service,
+    sessions: { refresh: async () => {}, handleSessionRemoved: (id) => { forgotten.push(id) } },
+  }
+  const registrations = []
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback(scope) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) { registrations.push({ options, value }); return () => {} },
+    },
+  })
+  const panel = registrations.find((entry) => entry.options.name === 'main')
+
+  render(panel.value)
+  await settle()
+  const header = collect(render(panel.value)).find((node) => node.props?.role === 'group')
+  header.props.onClick()
+  const victimRow = collect(render(panel.value)).find((node) => node.type === 'label' && node.props.key === VICTIM)
+  collect(victimRow).find((node) => node.type === 'input').props.onChange()
+  const deleteButton = collect(render(panel.value))
+    .find((node) => node.type === 'button' && node.children.flat().join('').includes('Delete 1 selected'))
+  await deleteButton.props.onClick()
+  await settle()
+
+  assert.deepEqual(forgotten, [VICTIM],
+    'the confirmed deletion is forgotten even when the batch reports a failure')
 })
 
 test('the sidebar entry renders the trash glyph at the size the row hands it', async () => {
@@ -1038,6 +1228,94 @@ test('the panel keeps its deletion report after reloading its list', async () =>
     .filter((node) => node.type === 'p')
     .map((node) => node.children.flat().join(''))
   assert.ok(notices.some((text) => text.includes('Deleted 1 session')), 'the report must survive the reload that follows it')
+})
+
+test('deleted rows drop immediately, before the reconciliation scan lands', async () => {
+  const { React, render } = statefulReactStub()
+  const factory = loadFactory()
+  const plugin = factory((id) => {
+    if (id === 'react') return React
+    if (id === 'react-dom') return { createPortal: (node) => node }
+    throw new Error(`unexpected require: ${id}`)
+  })
+
+  const VICTIM = 'session-aaaaaaaa-1111-2222-3333-444444444444'
+  const SURVIVOR = 'session-cccccccc-1111-2222-3333-444444444444'
+  const row = (id, title, bytes) => ({
+    id, workspaceKey: '--ws--', bytes, humanBytes: `${bytes} B`, parent: undefined, cwd: 'F:\\alpha', title, createdAt: 2000,
+  })
+  let releaseScan
+  const listCalls = []
+  const forgotten = []
+  const service = {
+    list: async () => {
+      listCalls.push(1)
+      if (listCalls.length === 1) {
+        return { sessions: [row(VICTIM, 'Victim', 10), row(SURVIVOR, 'Survivor', 100)] }
+      }
+      // The reconciliation scan stays in flight until the test releases it.
+      return new Promise((resolve) => {
+        releaseScan = () => resolve({ sessions: [row(SURVIVOR, 'Survivor', 100)] })
+      })
+    },
+    delete: async () => ({
+      ok: true,
+      deleted: [{ id: VICTIM, kind: 'session', bytes: 10 }],
+      summary: { sessionsDeleted: 1, bytesDeleted: 10 },
+    }),
+  }
+  const scope = {
+    'remote.sessionCleaner': service,
+    sessions: { refresh: async () => {}, handleSessionRemoved: (id) => { forgotten.push(id) } },
+  }
+  const registrations = []
+  plugin.apply({
+    locale: { getLocale: () => ({ active: 'en' }) },
+    remote: { $mount: async () => {} },
+    inject(keys, callback) { callback(scope) },
+    slots: {
+      inject(_name, callback) { callback() },
+      register(options, value) { registrations.push({ options, value }); return () => {} },
+    },
+  })
+  const panel = registrations.find((entry) => entry.options.name === 'main')
+
+  render(panel.value)
+  await settle()
+  // Expand the group, check the victim's row, start the deletion.
+  const header = collect(render(panel.value)).find((node) => node.props?.role === 'group')
+  header.props.onClick()
+  const victimRow = collect(render(panel.value)).find((node) => node.type === 'label' && node.props.key === VICTIM)
+  collect(victimRow).find((node) => node.type === 'input').props.onChange()
+  const deleteButton = collect(render(panel.value))
+    .find((node) => node.type === 'button' && node.children.flat().join('').includes('Delete 1 selected'))
+  const click = deleteButton.props.onClick()
+  await settle(2)
+
+  // The reconciliation scan is still in flight, yet the victim is already
+  // gone and the panel never flashed its loading state over the survivor.
+  const midFlight = render(panel.value)
+  const spans = collect(midFlight).filter((node) => node.type === 'span').map((node) => String(node.children[0]))
+  assert.ok(!spans.includes('Victim'), 'the deleted row drops at once')
+  assert.ok(spans.includes('Survivor'), 'the surviving row stays visible')
+  const paragraphs = collect(midFlight)
+    .filter((node) => node.type === 'p')
+    .map((node) => node.children.flat().join(''))
+  assert.ok(!paragraphs.some((text) => text.includes('Scanning')), 'no loading flash while the scan is in flight')
+  assert.ok(paragraphs.some((text) => text.includes('Deleted 1 session')), 'the report shows before the scan lands')
+  const groupHeader = collect(midFlight).find((node) => node.props?.role === 'group')
+  assert.ok(collect(groupHeader).some((span) => span.type === 'span' && String(span.children[0]).includes('1 session')),
+    'the group stats already count the survivor only')
+
+  releaseScan()
+  await click
+  await settle()
+  assert.equal(listCalls.length, 2, 'exactly one reconciliation scan follows the delete')
+  assert.deepEqual(forgotten, [VICTIM], 'the panel hands the confirmed id to the client snapshot removal')
+  const settled = render(panel.value)
+  assert.ok(!collect(settled).some((node) => node.type === 'span' && String(node.children[0]) === 'Victim'))
+  assert.ok(collect(settled).some((node) => node.type === 'p' && node.children.flat().join('').includes('Deleted 1 session')),
+    'the report survives the reconciliation scan')
 })
 
 test('renderMessages lays out both sides of a transcript', () => {

@@ -259,10 +259,9 @@ module.exports = function createPlugin(require) {
        * The client's session-list snapshot, when this composition publishes
        * one. The sidebar renders its rows from that snapshot, which the shell
        * only re-pulls on connect — so after a deletion the rows would linger
-       * until the next restart even though the files are gone. One refresh()
-       * re-runs session/list (a live disk scan on the Host) and drops every
-       * row whose session no longer exists. Dynamic injection: a composition
-       * without the service simply keeps the restart-based behavior.
+       * until the next restart even though the files are gone. Dynamic
+       * injection: a composition without the service simply keeps the
+       * restart-based behavior.
        */
       let sessionList
       try {
@@ -271,13 +270,63 @@ module.exports = function createPlugin(require) {
         }
       } catch { /* optional service: nothing to refresh */ }
 
-      /** Best-effort session-list refresh after a successful deletion. */
-      const refreshSessionList = () => {
+      /**
+       * Drop deleted sessions from the client snapshot and re-pull the
+       * baseline. Ordering is load-bearing: `handleSessionRemoved` must run
+       * AFTER the refresh settles. `refreshList()` swaps in a fresh mutation
+       * array the moment it starts, so a removal recorded earlier — from the
+       * forwarded `api-session/removed` event — is discarded when the pull
+       * lands, and the Host's session/list keeps returning a deleted session
+       * that is still attached live (cancelling its agent never detaches it;
+       * only its creator's disposer can), so the merged baseline resurrects
+       * the row into Ungrouped. Calling `handleSessionRemoved` after the
+       * refresh removes the row now AND leaves the removal mutation in the
+       * array the NEXT refresh replays against the baseline — one round of
+       * protection for as long as the session stays attached.
+       */
+      const forgottenIds = new Set()
+
+      /** Remove one deleted session's row from the client snapshot, if the snapshot service is present. */
+      const forgetSession = (id) => {
+        try { sessionList?.handleSessionRemoved?.(id) } catch { /* snapshot-only repair */ }
+      }
+
+      const forgetSessions = (sessionIds) => {
+        const ids = Array.isArray(sessionIds) ? sessionIds.filter((id) => typeof id === 'string') : []
+        for (const id of ids) forgottenIds.add(id)
+        const forget = () => {
+          for (const id of ids) forgetSession(id)
+        }
         try {
           const pending = sessionList?.refresh?.()
-          if (pending && typeof pending.catch === 'function') pending.catch(() => {})
-        } catch { /* a stale snapshot only delays the update to the next connect */ }
+          if (pending && typeof pending.then === 'function') pending.then(forget, forget)
+          else forget()
+        } catch {
+          forget()
+        }
       }
+
+      try {
+        if (sessionList && typeof sessionList.subscribe === 'function' && typeof sessionList.getListSnapshot === 'function') {
+          // Last line of defense against snapshot resurrections. Any baseline
+          // rebuild (a reconnect's handleConnected, a refresh we did not
+          // trigger) drops the mutation array and re-merges the Host list —
+          // which still contains a deleted-but-attached session. Whenever the
+          // snapshot changes, re-remove every known-deleted id it still
+          // carries. Gating on actual presence keeps this convergent: the
+          // removal drops the row, so the next pass has nothing to do.
+          sessionList.subscribe(() => {
+            if (forgottenIds.size === 0) return
+            let snapshot
+            try { snapshot = sessionList.getListSnapshot() } catch { return }
+            const items = Array.isArray(snapshot?.items) ? snapshot.items : []
+            if (items.length === 0) return
+            for (const entry of items) {
+              if (forgottenIds.has(entry?.sessionId)) forgetSession(entry.sessionId)
+            }
+          })
+        }
+      } catch { /* without a subscribable snapshot, the call-side forget is the only repair */ }
 
       const readFailure = () => acquireFailure
 
@@ -456,10 +505,10 @@ module.exports = function createPlugin(require) {
               setError(result.error ?? 'unknown failure')
               return
             }
-            // The files are gone: pull the client session list once so the
-            // row disappears now, not on the next restart — and tell an open
-            // cleanup panel to re-scan, since its list is a mount snapshot.
-            refreshSessionList()
+            // The files are gone: drop the rows from the client snapshot (see
+            // forgetSessions) and tell an open cleanup panel to re-scan, since
+            // its list is a mount snapshot.
+            forgetSessions([sessionId])
             deletionSignal.emit()
             confirmStore.dismiss()
           } catch (reason) {
@@ -582,7 +631,7 @@ module.exports = function createPlugin(require) {
         const page = createPanelPage(React, t, acquire, readFailure, {
           Modal,
           Button,
-          afterDelete: refreshSessionList,
+          afterDelete: forgetSessions,
           deletionSignal,
         })
         ctx.slots.inject('main', () => ctx.slots.register({
